@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+      - name: Clippy
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p rqz-ecc -p rqz-core -p rqz-cli --all-targets
+      - name: Test
+        run: cargo test -p rqz-ecc -p rqz-core -p rqz-cli
+      - name: Build CLI
+        run: cargo build --release -p rqz-cli
+      - name: Smoke test (pack, damage, repair, extract)
+        shell: bash
+        run: |
+          set -e
+          RQZ="$(pwd)/target/release/rqz"
+          mkdir -p /tmp/smoke/data && cd /tmp/smoke
+          head -c 3000000 /dev/urandom > data/blob.bin
+          seq 1 200000 > data/numbers.txt
+          "$RQZ" pack data -o t.rqz
+          "$RQZ" check t.rqz
+          "$RQZ" dev damage t.rqz -o bad.rqz --spans 6 --len 8192
+          set +e; "$RQZ" check bad.rqz; code=$?; set -e
+          test "$code" = 1
+          "$RQZ" x bad.rqz -o out
+          diff -r data out/data
+      - name: Smoke test (split volumes)
+        shell: bash
+        run: |
+          set -e
+          RQZ="$(pwd)/target/release/rqz"
+          cd /tmp/smoke
+          "$RQZ" pack data -o split.rqz --volume-size 1M --protect low
+          rm split.rqz.002
+          set +e; "$RQZ" check split.rqz.001; code=$?; set -e
+          test "$code" = 1
+          "$RQZ" x split.rqz.001 -o out-split
+          diff -r data out-split/data
+          "$RQZ" repair split.rqz.001 -o fixed
+          "$RQZ" check fixed/split.rqz.001
+      - name: Smoke test (serve over WebDAV)
+        shell: bash
+        run: |
+          set -e
+          RQZ="$(pwd)/target/release/rqz"
+          cd /tmp/smoke
+          "$RQZ" serve t.rqz --port 8099 > serve.log 2>&1 &
+          SERVER=$!
+          sleep 3
+          curl -sf -X PROPFIND -H "Depth: 1" http://127.0.0.1:8099/ | grep -q "data"
+          curl -sf http://127.0.0.1:8099/data/numbers.txt | cmp - data/numbers.txt
+          kill $SERVER || true
+      - name: Smoke test (FUSE mount)
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        run: |
+          set -e
+          sudo apt-get update -qq && sudo apt-get install -y -qq fuse3
+          RQZ="$(pwd)/target/release/rqz"
+          cd /tmp/smoke && mkdir -p mnt
+          "$RQZ" mount t.rqz mnt > mount.log 2>&1 &
+          sleep 3
+          diff -r data mnt/data
+          fusermount3 -u mnt
+
+  gui:
+    name: gui (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build GUI
+        run: cargo build --release -p rqz-gui
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build core for wasm (no default features)
+        run: cargo build -p rqz-core --no-default-features --target wasm32-unknown-unknown
+      - uses: jetli/wasm-pack-action@v0.4.0
+      - name: Smoke-test the WASM build under Node
+        run: |
+          wasm-pack build crates/rqz-wasm --release --target nodejs --out-dir pkg-node
+          node crates/rqz-wasm/smoke.cjs
+      - name: Build WASM package for the web
+        run: wasm-pack build crates/rqz-wasm --release --target web --out-dir ../../web/pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: |
+            web
+            !web/pkg/.gitignore

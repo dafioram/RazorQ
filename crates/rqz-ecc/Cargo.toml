@@ -1,0 +1,10 @@
+[package]
+name = "rqz-ecc"
+description = "RaptorQ erasure-coding helpers for razerq: grouping, striping, encode and decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+raptorq = "2"

@@ -1,0 +1,18 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Built WASM (CI builds it)
+/web/pkg
+
+# Local test artifacts
+*.rqz
+*.rqzp
+*.repaired.*
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+/crates/rqz-wasm/pkg-node

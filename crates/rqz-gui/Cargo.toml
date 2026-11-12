@@ -1,0 +1,16 @@
+[package]
+name = "rqz-gui"
+description = "razerq desktop app: health-first archive browser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.88"
+
+[[bin]]
+name = "rqz-gui"
+path = "src/main.rs"
+
+[dependencies]
+rqz-core = { path = "../rqz-core" }
+eframe = "0.33"
+rfd = "0.15"
