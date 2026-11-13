@@ -14,6 +14,25 @@ use rqz_core::writer::{ArchiveWriter, PackOptions, Protect};
 use serde_json::json;
 use std::io::Cursor;
 use std::sync::Arc;
+
+const MAX_INPUT_BYTES: u64 = 128 << 20;
+const MAX_MEMBER_BYTES: u64 = 64 << 20;
+const MAX_VOLUME_COUNT: u32 = 256;
+const MAX_BROWSER_PROTECTION: f64 = 30.0;
+
+fn check_input_size(size: u64) -> Result<(), JsError> {
+    if size > MAX_INPUT_BYTES {
+        return Err(err("archive or selection exceeds the browser's 128 MiB limit; use the CLI"));
+    }
+    Ok(())
+}
+
+fn check_archive(archive: &Archive<Source>) -> Result<(), JsError> {
+    if archive.header.detached() {
+        return Err(err("detached sidecars require the native app or CLI"));
+    }
+    Ok(())
+}
 use wasm_bindgen::prelude::*;
 
 fn err<E: std::fmt::Display>(e: E) -> JsError {
@@ -77,17 +96,29 @@ impl Rqz {
     /// encrypted archive still opens it "locked" (health checks work, browsing does not).
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: Vec<u8>, password: Option<String>) -> Result<Rqz, JsError> {
+        check_input_size(bytes.len() as u64)?;
         let archive = Archive::open(Source::Bytes(bytes), password.as_deref()).map_err(err)?;
+        check_archive(&archive)?;
         Ok(Rqz { archive, parts: vec![], repaired_volumes: None, password, assessment: None, repaired: None })
     }
 
     /// Open a split archive from its volume files (an Array of Uint8Array, in any order).
     /// Missing volumes are fine: the archive opens "incomplete" and can be repaired.
     pub fn open_volumes(parts: js_sys::Array, password: Option<String>) -> Result<Rqz, JsError> {
+        if parts.length() > MAX_VOLUME_COUNT {
+            return Err(err("too many volumes for the browser; use the CLI"));
+        }
+        let total: u64 = parts.iter().map(|p| js_sys::Uint8Array::new(&p).length() as u64).sum();
+        check_input_size(total)?;
         let parts: Vec<Arc<Vec<u8>>> = parts.iter().map(|p| Arc::new(js_sys::Uint8Array::new(&p).to_vec())).collect();
         let set = VolumeSet::from_parts(parts.iter().map(|p| Box::new(p.clone()) as Box<dyn ReadAt>).collect())
             .map_err(err)?;
+        check_input_size(set.len().map_err(err)?)?;
+        if set.count() > MAX_VOLUME_COUNT {
+            return Err(err("too many volumes for the browser; use the CLI"));
+        }
         let archive = Archive::open(Source::Volumes(set), password.as_deref()).map_err(err)?;
+        check_archive(&archive)?;
         Ok(Rqz { archive, parts, repaired_volumes: None, password, assessment: None, repaired: None })
     }
 
@@ -141,6 +172,7 @@ impl Rqz {
             "health": health_str(a.health), "blocks_total": a.blocks_total, "blocks_damaged": a.blocks_damaged,
             "headroom_ratio": a.min_headroom_ratio, "headroom_symbols": a.min_headroom_symbols,
             "structural": a.structural, "states": states, "groups": gj,
+            "stored_bytes_only": a.stored_bytes_only, "inventory_complete": a.inventory_complete,
         });
         self.assessment = Some(a);
         out.to_string()
@@ -153,59 +185,100 @@ impl Rqz {
         }
         let asm = self.assessment.as_ref().unwrap();
         let donor_archive = match donor {
-            Some(d) => Some(Archive::open(d, self.password.as_deref()).map_err(err)?),
+            Some(d) => {
+                check_input_size(d.len() as u64)?;
+                Some(Archive::open(d, None).map_err(err)?)
+            }
             None => None,
         };
-        let plan = self.archive.plan_repair(asm, donor_archive.as_ref().map(|d| d as &dyn Donor), &Quiet);
-        let (mut bytes, mut vols_out) = (Vec::new(), None);
-        match self.archive.source() {
-            Source::Bytes(b) => {
-                bytes = b.clone();
-                apply_patches_to_vec(&mut bytes, &plan.patches);
-            }
-            Source::Volumes(set) => {
-                let rewrites = set.plan_volume_patches(&plan.patches);
-                let count = rewrites.iter().map(|r| r.index + 1).max().unwrap_or(0).max(set.count());
-                let vh = set.vh_len as usize;
-                let mut vols: Vec<Vec<u8>> = (0..count)
-                    .map(|i| match set.supplied.get(i as usize).copied().flatten() {
-                        Some(k) => (*self.parts[k]).clone(),
-                        None => Vec::new(),
-                    })
-                    .collect();
-                for rw in rewrites {
-                    let v = &mut vols[rw.index as usize];
-                    if rw.create {
-                        *v = vec![0u8; vh + rw.payload_len as usize];
-                    }
-                    if let Some(h) = &rw.header {
-                        v[..h.len()].copy_from_slice(h);
-                    }
-                    apply_patches_to_vec(v, &rw.patches);
-                    if v.len() < vh + rw.payload_len as usize {
-                        v.resize(vh + rw.payload_len as usize, 0);
-                    }
-                }
-                vols_out = Some(vols);
-            }
+        self.repaired_volumes = None;
+        self.repaired = None;
+        let mut plan = self.archive.plan_repair(asm, donor_archive.as_ref().map(|d| d as &dyn Donor), &Quiet);
+        let mut after = asm.health;
+        let mut written = false;
+        let mut verified = false;
+        if plan.patches.iter().any(|p| p.offset + p.data.len() as u64 > MAX_INPUT_BYTES) {
+            return Err(err("repaired archive would exceed the browser's memory limit; use the CLI"));
         }
-        self.repaired_volumes = vols_out;
-        self.repaired = Some(bytes);
+        let incomplete = self.archive.source().is_incomplete();
+        if !plan.is_empty() || (incomplete && self.archive.has_valid_index()) {
+            let (mut bytes, mut vols_out) = (None, None);
+            match self.archive.source() {
+                Source::Bytes(b) => {
+                    let mut result = b.clone();
+                    apply_patches_to_vec(&mut result, &plan.patches);
+                    after = Archive::open(&result, self.password.as_deref())
+                        .map(|a| a.assess(&Quiet).health)
+                        .unwrap_or_else(|e| {
+                            plan.notes.push(format!("output verification failed: {e}"));
+                            Health::Damaged
+                        });
+                    bytes = Some(result);
+                }
+                Source::Volumes(set) => {
+                    let rewrites = set.plan_volume_patches(&plan.patches);
+                    let count = rewrites.iter().map(|r| r.index + 1).max().unwrap_or(0).max(set.count());
+                    let vh = set.vh_len as usize;
+                    if count > MAX_VOLUME_COUNT {
+                        return Err(err("repaired set would exceed the browser's volume limit; use the CLI"));
+                    }
+                    let mut vols: Vec<Vec<u8>> = (0..count)
+                        .map(|i| match set.supplied.get(i as usize).copied().flatten() {
+                            Some(k) => (*self.parts[k]).clone(),
+                            None => Vec::new(),
+                        })
+                        .collect();
+                    for rw in rewrites {
+                        let v = &mut vols[rw.index as usize];
+                        if rw.create {
+                            *v = vec![0u8; vh + rw.payload_len as usize];
+                        }
+                        if let Some(h) = &rw.header {
+                            v[..h.len()].copy_from_slice(h);
+                        }
+                        apply_patches_to_vec(v, &rw.patches);
+                        if v.len() < vh + rw.payload_len as usize {
+                            v.resize(vh + rw.payload_len as usize, 0);
+                        }
+                    }
+                    let views = vols.into_iter().map(Arc::new).collect::<Vec<_>>();
+                    after =
+                        VolumeSet::from_parts(views.iter().map(|v| Box::new(v.clone()) as Box<dyn ReadAt>).collect())
+                            .and_then(|set| Archive::open(set, self.password.as_deref()))
+                            .map(|a| a.assess(&Quiet).health)
+                            .unwrap_or_else(|e| {
+                                plan.notes.push(format!("output verification failed: {e}"));
+                                Health::Damaged
+                            });
+                    vols_out =
+                        Some(views.into_iter().map(|v| Arc::try_unwrap(v).unwrap_or_else(|v| (*v).clone())).collect());
+                }
+            }
+            self.repaired_volumes = vols_out;
+            self.repaired = bytes;
+            written = true;
+            verified = after == Health::Healthy;
+        }
+        if after != Health::Healthy && plan.notes.is_empty() {
+            plan.notes.push("damage remains; extract what is available or try a second copy".into());
+        }
         Ok(json!({
             "blocks_fixed": plan.blocks_fixed, "recovery_regenerated": plan.recovery_regenerated,
             "structural_fixed": plan.structural_fixed, "lost_blocks": plan.lost_blocks.len(), "lost_files": plan.lost_files,
+            "before": health_str(asm.health), "after": health_str(after), "verified": verified,
+            "stored_bytes_only": asm.stored_bytes_only, "written": written, "notes": plan.notes,
         })
         .to_string())
     }
 
-    pub fn repaired_bytes(&self) -> Option<Vec<u8>> {
-        self.repaired.clone()
+    pub fn repaired_bytes(&mut self) -> Option<Vec<u8>> {
+        self.repaired.take()
     }
 
     /// For split archives: the repaired volumes, in order (an Array of Uint8Array).
-    pub fn repaired_volumes(&self) -> js_sys::Array {
+    pub fn repaired_volumes(&mut self) -> js_sys::Array {
         let out = js_sys::Array::new();
-        for v in self.repaired_volumes.iter().flatten() {
+        for v in self.repaired_volumes.take().into_iter().flatten() {
             out.push(&js_sys::Uint8Array::from(&v[..]));
         }
         out
@@ -217,21 +290,37 @@ impl Rqz {
             .archive
             .visible_files(None)
             .into_iter()
-            .find(|f| f.path == path)
+            .find(|f| f.kind == KIND_FILE && f.path == path)
             .ok_or_else(|| err("no such file in this archive"))?;
+        if f.size > MAX_MEMBER_BYTES {
+            return Err(err("file exceeds the browser's 64 MiB extraction limit; use the CLI"));
+        }
         self.archive.read_file(f).map_err(err)
     }
 }
 
-fn options(protect_percent: f64, compression: &str, password: Option<String>, total: u64) -> PackOptions {
+fn options(
+    protect_percent: f64,
+    compression: &str,
+    password: Option<String>,
+    total: u64,
+) -> Result<PackOptions, JsError> {
+    if !(0.0..=MAX_BROWSER_PROTECTION).contains(&protect_percent) {
+        return Err(err("browser protection must be between 0% and 30%"));
+    }
     let mut o = PackOptions::default();
-    o.compression = Compression::parse(compression).unwrap_or(Compression::Normal);
+    o.compression = match compression {
+        "none" => Compression::None,
+        "fast" => Compression::Fast,
+        "normal" => Compression::Normal,
+        _ => return Err(err("browser compression must be none, fast, or normal")),
+    };
     o.protect =
         if protect_percent <= 0.0 { Protect::NONE } else { Protect { ratio: protect_percent / 100.0, min_repair: 4 } };
     o.password = password.filter(|p| !p.is_empty());
     o.total_hint = Some(total);
     o.now_unix = (js_sys::Date::now() / 1000.0) as i64;
-    o
+    Ok(o)
 }
 
 /// Create an archive in memory from named byte blobs (`blobs` is an Array of Uint8Array).
@@ -243,18 +332,26 @@ pub fn pack(
     compression: &str,
     password: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
-    let data: Vec<Vec<u8>> = blobs.iter().map(|b| js_sys::Uint8Array::new(&b).to_vec()).collect();
-    if data.len() != names.len() {
-        return Err(err("names and blobs differ in length"));
+    if blobs.length() as usize != names.len() || names.is_empty() {
+        return Err(err("provide one name per selected file"));
     }
-    let total: u64 = data.iter().map(|d| d.len() as u64).sum();
-    let o = options(protect_percent, compression, password, total);
+    let total: u64 = blobs.iter().map(|b| js_sys::Uint8Array::new(&b).length() as u64).sum();
+    check_input_size(total)?;
+    let o = options(protect_percent, compression, password, total)?;
+    let password = o.password.clone();
     let mtime = o.now_unix;
     let mut w = ArchiveWriter::create(Cursor::new(Vec::new()), o, &Quiet).map_err(err)?;
-    for (n, d) in names.iter().zip(&data) {
-        w.add_bytes(n, 0o644, mtime, d).map_err(err)?;
+    for (n, blob) in names.iter().zip(blobs.iter()) {
+        let data = js_sys::Uint8Array::new(&blob).to_vec();
+        w.add_bytes(n, 0o644, mtime, &data).map_err(err)?;
     }
-    Ok(w.finish().map_err(err)?.0.into_inner())
+    let image = w.finish().map_err(err)?.0.into_inner();
+    check_input_size(image.len() as u64)?;
+    let archive = Archive::open(&image, password.as_deref()).map_err(err)?;
+    if !archive.assess(&Quiet).is_healthy() {
+        return Err(err("created archive did not verify"));
+    }
+    Ok(image)
 }
 
 /// A ready-made archive for the "watch it heal" demo: small blocks so the map has plenty of squares.

@@ -27,6 +27,9 @@ assert.deepStrictEqual(Buffer.from(a.read_file(files[3].path)), Buffer.from(orig
 // Repair and re-verify.
 const report = JSON.parse(a.repair(undefined));
 assert.strictEqual(report.lost_blocks, 0);
+assert.strictEqual(report.after, "healthy");
+assert.strictEqual(report.verified, true);
+assert.strictEqual(report.written, true);
 const fixed = a.repaired_bytes();
 const b = new w.Rqz(fixed, undefined);
 assert.strictEqual(JSON.parse(b.check()).health, "healthy");
@@ -38,8 +41,13 @@ const packed = w.pack(["a.txt", "b.bin"], blobs, 10, "normal", "pw");
 assert.throws(() => new w.Rqz(packed, "wrong"));
 const locked = new w.Rqz(packed, undefined);
 assert.strictEqual(JSON.parse(locked.info()).locked, true);
-assert.strictEqual(JSON.parse(locked.check()).health, "healthy");
+const lockedCheck = JSON.parse(locked.check());
+assert.strictEqual(lockedCheck.health, "healthy");
+assert.strictEqual(lockedCheck.stored_bytes_only, true);
+assert.strictEqual(lockedCheck.inventory_complete, false);
+assert.throws(() => w.pack(["same.txt", "same.txt"], blobs, 10, "normal", undefined), /duplicate archive path/);
 const open = new w.Rqz(packed, "pw");
+assert.strictEqual(JSON.parse(open.repair(undefined)).written, false);
 assert.strictEqual(Buffer.from(open.read_file("b.bin")).toString("hex"), "010203");
 // Split volumes: lose any one volume (including the first), heal it, get the exact bytes back.
 const vols = w.demo_volumes();

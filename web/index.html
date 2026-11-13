@@ -93,6 +93,8 @@ footer{margin-top:40px;color:var(--muted);font-size:12px;border-top:1px solid va
   <p class="note" id="engine">Loading engine…</p>
 </section>
 
+<div id="banner" role="status" aria-live="polite"></div>
+
 <section id="result" class="hidden">
   <div class="card">
     <div id="status" class="status"><div class="dot"></div><div><h2 id="s-title"></h2><p id="s-detail"></p></div></div>
@@ -102,12 +104,13 @@ footer{margin-top:40px;color:var(--muted);font-size:12px;border-top:1px solid va
     <p class="note" id="map-note"></p>
     <div class="row" id="actions" style="margin-top:12px"></div>
     <div id="unlock" class="hidden"><label for="pw">This archive is encrypted. Health checks work without the password; enter it to list and extract files.</label><div class="row"><input id="pw" type="password" placeholder="password"><button id="unlock-btn">Unlock</button></div></div>
-    <div id="banner"></div>
+
   </div>
   <h3>Protection headroom</h3>
   <div class="card"><div class="bars" id="bars"></div><p class="note">Damage is spread across groups. The tightest groups decide whether an archive survives.</p></div>
   <h3>Files</h3>
   <div class="card scroll"><table id="files"></table></div>
+  <div class="row" id="file-pages"></div>
 </section>
 
 <details id="create">
@@ -116,14 +119,14 @@ footer{margin-top:40px;color:var(--muted);font-size:12px;border-top:1px solid va
     <label for="src">Files</label><input id="src" type="file" multiple>
     <label for="prot">Protection: <b id="prot-v">10%</b></label><input id="prot" type="range" min="0" max="30" value="10">
     <label for="comp">Compression</label>
-    <select id="comp"><option value="none">None (store)</option><option value="fast">Fast (lz4)</option><option value="normal" selected>Normal (zstd)</option></select>
+    <select id="comp"><option value="none">None (store)</option><option value="fast">Fast (lz4)</option><option value="normal" selected>Normal (fast zstd encoder)</option></select>
     <label for="pw2">Password (optional)</label><input id="pw2" type="password" placeholder="leave empty for none">
     <div class="row" style="margin-top:14px"><button id="make" disabled>Create &amp; download</button></div>
-    <p class="note">The browser build packs in memory, so it suits small archives. Use the <code>rqz</code> command line for large ones.</p>
+    <p class="note">Browser limits are 128 MiB per archive or selection, 256 volumes, and 64 MiB per extracted file. Use the <code>rqz</code> CLI for larger jobs.</p>
   </div>
 </details>
 
-<footer>razerq · MIT · <a href="https://github.com/YOUR_NAME/razerq" style="color:inherit">source</a></footer>
+<footer>razerq · MIT · <a href="https://github.com/dafioram/RazorQ" style="color:inherit">source</a></footer>
 </main>
 
 <script type="module">
@@ -131,156 +134,287 @@ const $ = (s) => document.querySelector(s);
 const fmt = (n) => { const u=["B","KB","MB","GB"]; let i=0,v=n; while(v>=1000&&i<3){v/=1000;i++} return (i?v.toFixed(1):v)+" "+u[i]; };
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-let worker, seq = 0; const pending = new Map();
+const MAX_BYTES = 128 * 1024 * 1024;
+const MAX_PARTS = 256;
+const PAGE_SIZE = 200;
+let worker;
+let seq = 0;
+let ready = false;
+let busy = false;
+let active = null;
+let filePage = 0;
+const pending = new Map();
+
+function banner(text, kind) {
+  $("#banner").innerHTML = `<div class="banner ${kind}">${esc(text)}</div>`;
+}
+
+function syncControls() {
+  for (const button of document.querySelectorAll("button")) {
+    button.disabled = busy || !ready || (button.id === "make" && !$("#src").files?.length);
+  }
+}
+
+function failWorker(message) {
+  ready = false;
+  $("#engine").textContent = message;
+  for (const task of pending.values()) task.reject(new Error(message));
+  pending.clear();
+  syncControls();
+}
+
+function call(op, args = {}, transfer = []) {
+  return new Promise((resolve, reject) => {
+    const id = ++seq;
+    pending.set(id, { resolve, reject });
+    try {
+      worker.postMessage({ id, op, args }, transfer);
+    } catch (error) {
+      pending.delete(id);
+      reject(error);
+    }
+  });
+}
+
 try {
   worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
-  worker.onmessage = (e) => { const { id, ok, result, error } = e.data; const p = pending.get(id); pending.delete(id); ok ? p.resolve(result) : p.reject(new Error(error)); };
-  worker.onerror = () => { $("#engine").textContent = "The WASM engine is not built. Run `wasm-pack build crates/rqz-wasm --target web --out-dir ../../web/pkg` first."; };
-} catch { $("#engine").textContent = "This browser cannot run module workers."; }
-const call = (op, args = {}, transfer = []) => new Promise((resolve, reject) => { const id = ++seq; pending.set(id, { resolve, reject }); worker.postMessage({ id, op, args }, transfer); });
-
-call("version").then((v) => { $("#engine").textContent = `Engine ${v} ready. Files stay on your device.`; for (const b of ["#pick", "#demo", "#demo-split"]) $(b).disabled = false; })
-  .catch(() => {});
-for (const b of ["#pick", "#demo", "#demo-split"]) $(b).disabled = true;
-
-let bytes = null, volumes = null, name = "archive.rqz", stem = "archive.rqz", opened = null, password = "";
-const isVolume = (u8) => u8.length > 8 && u8[1] === 0x52 && u8[2] === 0x51 && u8[3] === 0x56;
-const volName = (i) => `${stem}.${String(i + 1).padStart(3, "0")}`;
-
-async function openVolumeSet(parts, n, pw = "") {
-  volumes = parts; bytes = null; name = n; password = pw;
-  $("#banner").innerHTML = "";
-  try {
-    opened = await call("openVolumes", { parts: parts.map((p) => p.slice()), password: pw });
-    render(opened);
-  } catch (e) { banner(e.message, "err"); }
+  worker.onmessage = (e) => {
+    const { id, ok, result, error } = e.data;
+    const task = pending.get(id);
+    if (!task) return;
+    pending.delete(id);
+    if (ok) task.resolve(result);
+    else task.reject(new Error(error));
+  };
+  worker.onerror = () => failWorker("The archive engine could not load or stopped responding. Reload the page to restart it.");
+  call("version").then((version) => {
+    ready = true;
+    $("#engine").textContent = `Engine ${version} ready. Files stay on your device.`;
+    syncControls();
+  }).catch((error) => failWorker(error.message));
+} catch {
+  failWorker("This browser cannot run the archive engine.");
 }
+syncControls();
 
-async function openFiles(fileList) {
-  const files = [...fileList];
-  const all = await Promise.all(files.map(async (f) => new Uint8Array(await f.arrayBuffer())));
-  if (files.length > 1 || isVolume(all[0])) {
-    stem = files[0].name.replace(/\.\d{3,}$/, "");
-    return openVolumeSet(all, stem);
+async function perform(task) {
+  if (busy || !ready) return;
+  busy = true;
+  $("#banner").textContent = "";
+  syncControls();
+  try {
+    await task();
+  } catch (error) {
+    banner(error.message, "err");
+  } finally {
+    busy = false;
+    syncControls();
   }
-  stem = files[0].name;
-  return openBytes(all[0], files[0].name);
 }
 
-async function openBytes(b, n, pw = "") {
-  volumes = null; bytes = b; name = n; password = pw;
-  $("#banner").innerHTML = "";
-  try {
-    opened = await call("open", { bytes: b.slice(), password: pw });
-    render(opened);
-  } catch (e) { banner(e.message, "err"); }
+function preflight(files, volumes = false) {
+  if (files.reduce((sum, file) => sum + file.size, 0) > MAX_BYTES || (volumes && files.length > MAX_PARTS)) {
+    throw new Error("Selection exceeds the browser's limits. Use the rqz CLI.");
+  }
 }
 
-function banner(text, kind) { $("#banner").innerHTML = `<div class="banner ${kind}">${esc(text)}</div>`; }
+const isVolume = (u8) => u8.length >= 8 && u8[0] === 0x89 && u8[1] === 0x52 && u8[2] === 0x51 && u8[3] === 0x56;
+const volumeName = (name, i) => `${name}.${String(i + 1).padStart(3, "0")}`;
+const repairedName = (name) => name.replace(/(?:\.repaired)?(?:\.rqz)?$/i, ".repaired.rqz");
 
-function render({ info, files, check }) {
+async function openSource(source, password = "") {
+  let result;
+  if (source.volumes) {
+    const parts = source.volumes.map((part) => part.slice());
+    result = await call("openVolumes", { parts, password }, parts.map((part) => part.buffer));
+  } else {
+    const bytes = source.bytes.slice();
+    result = await call("open", { bytes, password }, [bytes.buffer]);
+  }
+  active = { ...source, password, ...result };
+  filePage = 0;
+  render(active);
+}
+
+function openFiles(fileList) {
+  return perform(async () => {
+    const files = [...fileList];
+    preflight(files, true);
+    const all = await Promise.all(files.map(async (file) => new Uint8Array(await file.arrayBuffer())));
+    if (files.length > 1 || isVolume(all[0]) || /\.rqz\.\d{3,}$/i.test(files[0].name)) {
+      await openSource({ volumes: all, name: files[0].name.replace(/\.\d{3,}$/, "") });
+    } else {
+      await openSource({ bytes: all[0], name: files[0].name });
+    }
+  });
+}
+
+function renderFiles() {
+  const { info, files } = active;
+  const start = filePage * PAGE_SIZE;
+  const rows = files.slice(start, start + PAGE_SIZE).map((file) =>
+    `<tr><td>${esc(file.path)}</td><td>${fmt(file.size)}</td><td><button class="ghost" data-path="${esc(file.path)}">Get</button></td></tr>`);
+  $("#files").innerHTML = rows.join("") || `<tr><td class="note">${info.locked ? "Unlock to list files." : "No visible files."}</td></tr>`;
+  const pages = $("#file-pages");
+  pages.textContent = "";
+  const addPageButton = (label, step) => {
+    const button = document.createElement("button");
+    button.textContent = label;
+    button.className = "ghost";
+    button.addEventListener("click", () => {
+      filePage += step;
+      renderFiles();
+      syncControls();
+    });
+    pages.append(button);
+  };
+  if (start > 0) addPageButton("Previous files", -1);
+  if (files.length > PAGE_SIZE) pages.append(` Files ${start + 1}–${Math.min(start + PAGE_SIZE, files.length)} of ${files.length} `);
+  if (start + PAGE_SIZE < files.length) addPageButton("Next files", 1);
+}
+
+function render({ info, check, bytes, volumes, name, repaired, demo }) {
   $("#result").classList.remove("hidden");
-  const h = check.health, cls = h === "healthy" ? "ok" : h === "repairable" ? "warn" : "bad";
+  const { health, inventory_complete: complete, stored_bytes_only: locked } = check;
   const low = check.headroom_ratio != null && check.headroom_ratio < 0.02;
-  $("#status").className = "status " + (h === "healthy" && low ? "warn" : cls);
-  $("#s-title").textContent = h === "healthy" ? (low ? "Healthy, but nearly out of protection" : "Healthy") : h === "repairable" ? "Repairable" : "Damaged beyond recovery";
-  const lost = check.states.split("").filter((c) => c === "r").length;
-  $("#s-detail").textContent = h === "healthy" ? `All ${check.blocks_total} blocks verify.` :
-    h === "repairable" ? `${check.blocks_damaged} of ${check.blocks_total} blocks are damaged. Every one can be rebuilt.` :
-    `${lost} blocks cannot be recovered. Everything else is intact.`;
-  if (check.structural.length) $("#s-detail").textContent += " " + check.structural.join("; ") + ".";
-  const spare = check.headroom_ratio == null ? "none" : (check.headroom_ratio * 100).toFixed(1) + "%";
-  $("#stats").innerHTML = [["Files", info.files], ["Stored", fmt(info.stored_bytes)], ["Recovery data", fmt(info.recovery_bytes)], ["Spare in tightest group", spare]]
+  $("#status").className = "status " + (health === "healthy" ? (low ? "warn" : "ok") : health === "repairable" ? "warn" : "bad");
+  $("#s-title").textContent = health === "healthy"
+    ? (locked ? "Stored bytes healthy (locked)" : low ? "Healthy, but nearly out of protection" : "Healthy")
+    : health === "repairable" ? "Repairable" : complete ? "Damaged beyond recovery" : "Incomplete archive";
+  const lost = [...check.states].filter((state) => state === "r").length;
+  const detail = health === "healthy" ? `All ${check.blocks_total} checked blocks verify.`
+    : health === "repairable" ? `${check.blocks_damaged} of ${check.blocks_total} blocks have recoverable damage.`
+    : `${lost} known block(s) could not be recovered with the available data.`;
+  $("#s-detail").textContent = [detail, ...check.structural].join(" ");
+  const spare = check.headroom_symbols == null ? "none" : `${check.headroom_symbols} symbols`;
+  $("#stats").innerHTML = [["Files", locked ? "locked" : info.files], ["Stored", fmt(info.stored_bytes)],
+    ["Recovery data", fmt(info.recovery_bytes)], ["Minimum headroom", spare]]
     .concat(info.volumes ? [["Volumes", info.volumes + (info.missing_volumes.length ? ` (${info.missing_volumes.length} missing)` : "")]] : [])
-    .map(([k, v]) => `<div><small>${k}</small><strong>${v}</strong></div>`).join("");
-  drawMap(check.states);
-  $("#map-note").textContent = info.weak_protection || "";
-  $("#bars").innerHTML = check.groups.slice(0, 8).map((g) => {
-    const pct = g.repair_total ? Math.max(0, (g.repair_ok - g.erased) / g.repair_total) * 100 : 0;
-    return `<div class="bar"><span>group ${g.group}</span><div><i style="width:${pct}%;${g.repair_ok < g.erased ? "background:var(--bad)" : pct < 30 ? "background:var(--warn)" : ""}"></i></div><span>${g.repair_ok} spare · ${g.erased} erased</span></div>`;
+    .map(([label, value]) => `<div><small>${label}</small><strong>${value}</strong></div>`).join("");
+  drawMap(check.states, info.weak_protection);
+  $("#bars").innerHTML = check.groups.slice(0, 8).map((group) => {
+    const remaining = group.repair_ok - group.erased;
+    const pct = group.repair_total ? Math.max(0, remaining / group.repair_total) * 100 : 0;
+    return `<div class="bar"><span>set ${group.set} · group ${group.group}</span><div><i style="width:${pct}%;${remaining < 0 ? "background:var(--bad)" : pct < 30 ? "background:var(--warn)" : ""}"></i></div><span>${remaining} spare · ${group.erased} erased</span></div>`;
   }).join("") || "<span class=note>No recovery groups.</span>";
   $("#unlock").classList.toggle("hidden", !info.locked);
-  const rows = files.slice(0, 2000).map((f) => `<tr><td>${esc(f.path)}</td><td>${fmt(f.size)}</td><td><button class="ghost" data-path="${esc(f.path)}">Get</button></td></tr>`).join("");
-  $("#files").innerHTML = rows || `<tr><td class="note">${info.locked ? "Locked: file names are encrypted." : "No files."}</td></tr>`;
-  const a = $("#actions"); a.innerHTML = "";
-  if (h !== "healthy") a.insertAdjacentHTML("beforeend", `<button id="repair">Repair in memory</button>`);
-  if (name.includes(".repaired")) a.insertAdjacentHTML("beforeend", `<button id="dl">${volumes ? "Download repaired volumes" : "Download repaired copy"}</button>`);
-  if (name === "demo.rqz" || name === "demo-damaged.rqz") a.insertAdjacentHTML("beforeend", `<button id="break" class="ghost">Damage it</button>`);
-  if (volumes && name.startsWith("demo-split") && !name.includes(".repaired") && !info.missing_volumes.length) a.insertAdjacentHTML("beforeend", `<button id="lose" class="ghost">Lose a volume</button>`);
-  $("#repair")?.addEventListener("click", repair);
-  $("#dl")?.addEventListener("click", () => (volumes ? volumes.forEach((v, i) => setTimeout(() => save(v, volName(i)), i * 250)) : save(bytes, name)));
-  $("#lose")?.addEventListener("click", loseVolume);
-  $("#break")?.addEventListener("click", breakIt);
+  renderFiles();
+  const actions = $("#actions");
+  actions.textContent = "";
+  const button = (id, label, action) => {
+    const element = document.createElement("button");
+    element.id = id;
+    element.textContent = label;
+    element.addEventListener("click", () => perform(action));
+    actions.append(element);
+  };
+  if (health !== "healthy") button("repair", "Repair in memory", repair);
+  if (repaired && volumes) {
+    volumes.forEach((part, i) => button(`dl-${i + 1}`, `Download volume ${i + 1}`, () => save(part, volumeName(name, i))));
+  } else if (repaired) {
+    button("dl", "Download repaired copy", () => save(bytes, name));
+  }
+  if (demo === "single") button("break", "Damage it", breakIt);
+  if (demo === "split" && !info.missing_volumes.length) button("lose", "Lose a volume", loseVolume);
 }
 
-function drawMap(states) {
-  const n = states.length, cells = Math.min(n, 600), per = Math.ceil(n / cells);
-  const m = $("#map"), html = [];
-  for (let c = 0; c < cells; c++) {
-    const s = states.slice(c * per, (c + 1) * per);
-    const k = s.includes("r") ? "r" : s.includes("a") ? "a" : "g";
-    html.push(`<i class="${k}" style="transition-delay:${Math.min(c * 6, 900)}ms" title="blocks ${c * per + 1}–${Math.min(n, (c + 1) * per)}"></i>`);
+function drawMap(states, warning) {
+  const per = Math.ceil(states.length / 600);
+  const cells = [];
+  for (let start = 0; start < states.length; start += per) {
+    const chunk = states.slice(start, start + per);
+    const color = chunk.includes("r") ? "r" : chunk.includes("a") ? "a" : "g";
+    cells.push(`<i class="${color}" title="blocks ${start + 1}–${Math.min(states.length, start + per)}"></i>`);
   }
-  m.innerHTML = html.join("");
-  if (per > 1) $("#map-note").textContent = `Each square covers ${per} blocks.`;
+  $("#map").innerHTML = cells.join("");
+  $("#map-note").textContent = [per > 1 ? `Each square covers up to ${per} blocks.` : "", warning].filter(Boolean).join(" ");
 }
 
 async function repair() {
-  try {
-    const r = await call("repair", {});
-    if (r.volumes) await openVolumeSet(r.volumes, name.replace(/(\.repaired)?$/, ".repaired"), password);
-    else await openBytes(r.bytes, name.replace(/(\.repaired)?(\.rqz)?$/, ".repaired.rqz"), password);
-    const lost = r.report.lost_files.length;
-    banner(lost ? `Repaired what was possible. Lost: ${r.report.lost_files.join(", ")}` : `Repaired ${r.report.blocks_fixed} block(s) and regenerated ${r.report.recovery_regenerated} recovery symbol(s). The original is untouched.`, lost ? "err" : "good");
-  } catch (e) { banner(e.message, "err"); }
+  const { report, volumes, bytes } = await call("repair");
+  if (report.written) {
+    const name = repairedName(active.name);
+    await openSource({ bytes, volumes: volumes.length ? volumes : null, name, repaired: true }, active.password);
+  }
+  const status = report.verified
+    ? (report.stored_bytes_only ? "Repair verified for stored bytes. Unlock to verify files." : "Repair verified.")
+    : report.after === "healthy" ? "Nothing to repair." : "Repair incomplete.";
+  const details = [status, ...(report.lost_blocks ? [`${report.lost_blocks} unrecovered block(s).`] : []),
+    ...report.lost_files.map((file) => `Lost: ${file}`), ...report.notes];
+  banner(details.join(" "), report.after === "healthy" ? "good" : "err");
 }
 
 async function loseVolume() {
-  const gone = 1 + Math.floor(Math.random() * (volumes.length - 2)); // never the first or last: show the interesting case
-  const rest = volumes.filter((_, i) => i !== gone);
-  await openVolumeSet(rest, "demo-split-damaged");
-  banner(`Volume ${gone + 1} of ${volumes.length + 1} is gone. Every file is still readable: its blocks are rebuilt from the recovery data. Now repair it.`, "good");
+  const { volumes } = active;
+  const gone = 1 + Math.floor(Math.random() * (volumes.length - 2));
+  await openSource({ volumes: volumes.filter((_, i) => i !== gone), name: "demo-split-damaged.rqz" });
+  banner(`Removed volume ${gone + 1} of ${volumes.length}. Try extracting a file or repairing the set.`, "good");
 }
 
 async function breakIt() {
-  const b = bytes.slice(), start = Math.floor(b.length * 0.18), len = Math.floor(b.length * 0.05);
-  for (let i = start; i < start + len; i++) b[i] ^= 0xa5;
-  await openBytes(b, "demo-damaged.rqz");
-  banner(`Flipped ${fmt(len)} in the middle of the file. Now repair it.`, "good");
+  const bytes = active.bytes.slice();
+  const start = Math.floor(bytes.length * 0.18);
+  const len = Math.floor(bytes.length * 0.05);
+  for (let i = start; i < start + len; i++) bytes[i] ^= 0xa5;
+  await openSource({ bytes, name: "demo-damaged.rqz" });
+  banner(`Flipped ${fmt(len)} in the middle of the archive.`, "good");
 }
 
-function save(b, n) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([b])); a.download = n; a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+function save(bytes, name) {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([bytes]));
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 5000);
 }
 
-$("#files").addEventListener("click", async (e) => {
-  const p = e.target.closest("button")?.dataset.path; if (!p) return;
-  try { const b = await call("read", { path: p }); save(b, p.split("/").pop()); } catch (err) { banner(err.message, "err"); }
+$("#files").addEventListener("click", (e) => {
+  const path = e.target.closest("button")?.dataset.path;
+  if (path) perform(async () => save(await call("read", { path }), path.split("/").pop()));
 });
-$("#unlock-btn").addEventListener("click", () => openBytes(bytes, name, $("#pw").value));
-$("#demo").addEventListener("click", async () => { const b = await call("demo"); await openBytes(b, "demo.rqz"); });
-$("#demo-split").addEventListener("click", async () => { stem = "demo-split.rqz"; const v = await call("demoVolumes"); await openVolumeSet(v, "demo-split"); });
+$("#unlock-btn").addEventListener("click", () => perform(async () => {
+  await openSource(active, $("#pw").value);
+  $("#pw").value = "";
+}));
+$("#demo").addEventListener("click", () => perform(async () => {
+  await openSource({ bytes: await call("demo"), name: "demo.rqz", demo: "single" });
+}));
+$("#demo-split").addEventListener("click", () => perform(async () => {
+  await openSource({ volumes: await call("demoVolumes"), name: "demo-split.rqz", demo: "split" });
+}));
 $("#pick").addEventListener("click", () => $("#file").click());
-$("#file").addEventListener("change", (e) => { if (e.target.files.length) openFiles(e.target.files); });
-const drop = $("#drop");
-["dragover", "dragenter"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
-["dragleave", "drop"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
-document.addEventListener("drop", (e) => { if (e.dataTransfer?.files?.length) openFiles(e.dataTransfer.files); });
-
-// Create panel
-$("#prot").addEventListener("input", (e) => ($("#prot-v").textContent = e.target.value + "%"));
-$("#src").addEventListener("change", (e) => ($("#make").disabled = !e.target.files.length));
-$("#make").addEventListener("click", async () => {
-  const files = [...$("#src").files]; if (!files.length) return;
-  const blobs = await Promise.all(files.map((f) => f.arrayBuffer()));
-  try {
-    const out = await call("pack", { names: files.map((f) => f.name), blobs, protect: +$("#prot").value, compression: $("#comp").value, password: $("#pw2").value }, blobs);
-    save(out, "archive.rqz");
-    await openBytes(out.slice(), "archive.rqz", $("#pw2").value);
-  } catch (e) { banner(e.message, "err"); $("#result").classList.remove("hidden"); }
+$("#file").addEventListener("change", (e) => {
+  if (e.target.files.length) openFiles(e.target.files);
+  e.target.value = "";
 });
+const drop = $("#drop");
+["dragover", "dragenter"].forEach((type) => document.addEventListener(type, (e) => {
+  e.preventDefault();
+  if (!busy && ready) drop.classList.add("over");
+}));
+["dragleave", "drop"].forEach((type) => document.addEventListener(type, (e) => {
+  e.preventDefault();
+  drop.classList.remove("over");
+}));
+document.addEventListener("drop", (e) => {
+  if (e.dataTransfer?.files?.length) openFiles(e.dataTransfer.files);
+});
+
+$("#prot").addEventListener("input", (e) => { $("#prot-v").textContent = e.target.value + "%"; });
+$("#src").addEventListener("change", syncControls);
+$("#make").addEventListener("click", () => perform(async () => {
+  const files = [...$("#src").files];
+  preflight(files);
+  const password = $("#pw2").value;
+  const blobs = await Promise.all(files.map(async (file) => new Uint8Array(await file.arrayBuffer())));
+  const bytes = await call("pack", {
+    names: files.map((file) => file.name), blobs, protect: +$("#prot").value,
+    compression: $("#comp").value, password,
+  }, blobs.map((blob) => blob.buffer));
+  await openSource({ bytes, name: "archive.rqz" }, password);
+  save(bytes, "archive.rqz");
+  banner("Archive verified and download started.", "good");
+}));
 </script>
 </body>
 </html>
