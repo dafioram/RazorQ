@@ -78,6 +78,15 @@ cargo test  -p rqz-ecc -p rqz-core -p rqz-cli
 Rust 1.89 or newer. CI uses the stable toolchain. The default build links the C `zstd` library for speed. The WASM build uses
 pure-Rust codecs only, and can read everything the native build writes.
 
+### Publish a release
+
+On [GitHub Releases](https://github.com/dafioram/RazorQ/releases), publish a release with a
+new tag such as `v1-rc2` pointing to the commit you want to ship. The Release workflow tests and
+builds that tagged commit, then attaches the CLI and GUI together for Windows x86-64 (`.zip`),
+Linux x86-64 (`.tar.gz`), and macOS ARM64 (`.tar.gz`). Drafts can hold release notes until publication.
+Use **Actions → Release → Run workflow** for a build without a release. Manual runs and pull
+requests that change the build produce downloadable Actions artifacts.
+
 ### WASM
 
 ```console
