@@ -457,8 +457,7 @@ pub fn add_paths(
     progress: &dyn Progress,
 ) -> Result<PackResult> {
     let pw = opts.password.clone();
-    let src = Source::open(archive)?;
-    if src.is_split() {
+    if Source::open(archive)?.is_split() {
         return Err(Error::Unsupported("adding to a split archive is not supported yet".into()));
     }
     let _lock = lock_archive(archive)?;
@@ -495,6 +494,8 @@ pub fn add_paths(
     if verify {
         verify_written(stage.path(), pw.as_deref(), progress)?;
     }
+    // Windows cannot replace the destination while our reader still holds it open.
+    drop(a);
     publish_file(stage, archive, true)?;
     Ok(PackResult { summary, verified: verify })
 }
@@ -505,8 +506,7 @@ pub fn add_protection_file(
     password: Option<&str>,
     progress: &dyn Progress,
 ) -> Result<u32> {
-    let src = Source::open(path)?;
-    if src.is_split() {
+    if Source::open(path)?.is_split() {
         return Err(Error::Unsupported("add-protection is not supported on split archives yet".into()));
     }
     let _lock = lock_archive(path)?;
@@ -521,6 +521,7 @@ pub fn add_protection_file(
     f.sync_all()?;
     drop(f);
     verify_written(stage.path(), password, progress)?;
+    drop(a);
     publish_file(stage, path, true)?;
     Ok(added)
 }
@@ -796,6 +797,9 @@ pub fn repair_file(path: &Path, o: &RepairOptions, progress: &dyn Progress) -> R
         if o.in_place && !report.verified {
             return Err(Error::Other("repair did not verify; originals were preserved".into()));
         }
+        // The donor may also point to the original archive.
+        drop(donor);
+        drop(a);
         if let Some((file, output)) = target_stage {
             publish_file(file, &output, false)?;
             report.outputs.push(output);

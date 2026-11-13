@@ -78,6 +78,45 @@ fn top_up_protects_an_unprotected_archive_without_a_snapshot() {
 }
 
 #[test]
+fn append_replaces_archive_and_keeps_existing_files() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("test.rqz");
+    let first = t.path().join("first.txt");
+    let second = t.path().join("second.txt");
+    fs::write(&first, b"first").unwrap();
+    fs::write(&second, b"second").unwrap();
+    fsops::pack_paths(&[first], &path, PackOptions::default(), true, &Quiet).unwrap();
+    fsops::add_paths(&path, &[second], PackOptions::default(), true, &Quiet).unwrap();
+
+    let archive = Archive::open(Source::open(&path).unwrap(), None).unwrap();
+    assert_eq!(archive.info().snapshots.len(), 2);
+    let files = archive.visible_files(None);
+    assert_eq!(files.len(), 2);
+    assert_eq!(archive.read_file(files[0]).unwrap(), b"first");
+    assert_eq!(archive.read_file(files[1]).unwrap(), b"second");
+    assert!(archive.assess(&Quiet).is_healthy());
+}
+
+#[test]
+fn in_place_repair_replaces_archive_even_if_donor_uses_same_path() {
+    let t = tempfile::tempdir().unwrap();
+    let path = t.path().join("test.rqz");
+    let source = t.path().join("input");
+    fs::write(&source, b"some data").unwrap();
+    fsops::pack_paths(&[source], &path, PackOptions::default(), true, &Quiet).unwrap();
+    let original = fs::read(&path).unwrap();
+    let mut damaged = original.clone();
+    damaged[100] ^= 1;
+    fs::write(&path, damaged).unwrap();
+
+    let opts = RepairOptions { in_place: true, donor: Some(path.clone()), ..Default::default() };
+    let report = fsops::repair_file(&path, &opts, &Quiet).unwrap();
+    assert!(report.verified);
+    assert_eq!(report.written, Some(path.clone()));
+    assert_eq!(fs::read(path).unwrap(), original);
+}
+
+#[test]
 fn extract_preserves_existing_files() {
     let t = tempfile::tempdir().unwrap();
     let input = t.path().join("input");
