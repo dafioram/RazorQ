@@ -2,6 +2,7 @@
 //! razerq core: a compression + erasure-coding container that heals itself.
 
 pub mod archive;
+mod catalog;
 pub mod codec;
 pub mod crypto;
 pub mod error;

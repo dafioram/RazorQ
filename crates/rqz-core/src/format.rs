@@ -19,7 +19,8 @@ pub const FOOTER_LEN: usize = 64;
 /// Unknown *read-only* bit: extract/check only. Unknown *optional* bit: ignore.
 pub const REQ_ENCRYPTED: u64 = 1 << 0;
 pub const REQ_DETACHED: u64 = 1 << 1;
-pub const KNOWN_REQUIRED: u64 = REQ_ENCRYPTED | REQ_DETACHED;
+pub const REQ_CHECKPOINTS: u64 = 1 << 2;
+pub const KNOWN_REQUIRED: u64 = REQ_ENCRYPTED | REQ_DETACHED | REQ_CHECKPOINTS;
 pub const KNOWN_READONLY: u64 = 0;
 pub const OPT_TINY_PROFILE: u64 = 1 << 0;
 
@@ -30,11 +31,15 @@ pub mod kind {
     pub const DICT: u8 = 3; // reserved
     pub const CRCTAB: u8 = 4; // detached sidecars: per-symbol CRCs of one protected block
     pub const META: u8 = 5;
+    pub const INDEX_MIRROR: u8 = 6;
+    pub const CATALOG: u8 = 7;
 }
 pub mod flag {
     pub const ENCRYPTED: u16 = 1;
     pub const DEDUP: u16 = 2; // reserved
     pub const SYMCRC: u16 = 4;
+    pub const RANDOM_NONCE: u16 = 8;
+    pub const RAW_OFFSET: u16 = 16;
 }
 
 pub fn hash128(data: &[u8]) -> [u8; 16] {
@@ -83,6 +88,8 @@ pub struct Header {
     pub symbol_size: u16,
     pub target_k: u32,
     pub writer: String,
+    pub generation: u64,
+    pub inventory: Option<([u8; 16], [u8; 16])>,
     pub kdf: Option<Kdf>,
     pub key_check: Option<[u8; 16]>,
 }
@@ -90,6 +97,8 @@ pub struct Header {
 const TLV_WRITER: u16 = 1;
 const TLV_KDF: u16 = 2;
 const TLV_KEYCHECK: u16 = 3;
+const TLV_GENERATION: u16 = 4;
+const TLV_INVENTORY: u16 = 5;
 const HDR_FIXED: usize = 76;
 
 impl Header {
@@ -108,6 +117,8 @@ impl Header {
             symbol_size: 4096,
             target_k: 12_000,
             writer: format!("rqz-core {}", env!("CARGO_PKG_VERSION")),
+            generation: 0,
+            inventory: None,
             kdf: None,
             key_check: None,
         }
@@ -159,6 +170,15 @@ impl Header {
         if let Some(c) = &self.key_check {
             put(TLV_KEYCHECK, c);
         }
+        if self.generation != 0 {
+            put(TLV_GENERATION, &self.generation.to_le_bytes());
+        }
+        if let Some((blocks, files)) = self.inventory {
+            let mut hashes = [0; 32];
+            hashes[..16].copy_from_slice(&blocks);
+            hashes[16..].copy_from_slice(&files);
+            put(TLV_INVENTORY, &hashes);
+        }
         let c = crc(&b[..len - 4]);
         b[len - 4..].copy_from_slice(&c.to_le_bytes());
         b
@@ -207,6 +227,10 @@ impl Header {
                     let mut c = [0u8; 16];
                     c.copy_from_slice(v);
                     h.key_check = Some(c);
+                }
+                TLV_GENERATION if l == 8 => h.generation = u64_at(v, 0),
+                TLV_INVENTORY if l == 32 => {
+                    h.inventory = Some((v[..16].try_into().unwrap(), v[16..].try_into().unwrap()))
                 }
                 _ => {}
             }
@@ -292,6 +316,10 @@ impl SegHeader {
         })
     }
 
+    pub fn raw_offset(&self) -> Option<u64> {
+        (self.flags & flag::RAW_OFFSET != 0).then(|| u64::from(self.owner) | (u64::from(self.stripe) << 32))
+    }
+
     pub fn has_symcrc(&self) -> bool {
         self.flags & flag::SYMCRC != 0
     }
@@ -345,6 +373,7 @@ pub struct Footer {
     pub index_hash: [u8; 16],
     pub uuid: [u8; 16],
     pub total_segments: u32,
+    pub index_gap: u32,
 }
 
 impl Footer {
@@ -356,6 +385,7 @@ impl Footer {
         b[20..36].copy_from_slice(&self.index_hash);
         b[36..52].copy_from_slice(&self.uuid);
         b[52..56].copy_from_slice(&self.total_segments.to_le_bytes());
+        b[56..60].copy_from_slice(&self.index_gap.to_le_bytes());
         let c = crc(&b[..60]);
         b[60..64].copy_from_slice(&c.to_le_bytes());
         b
@@ -374,6 +404,7 @@ impl Footer {
             index_hash,
             uuid,
             total_segments: u32_at(b, 52),
+            index_gap: u32_at(b, 56),
         })
     }
 }
@@ -416,7 +447,14 @@ mod tests {
             stripe: 7,
         };
         assert_eq!(SegHeader::decode(&s.encode()).unwrap(), s);
-        let f = Footer { index_offset: 123, index_len: 45, index_hash: [1; 16], uuid: [2; 16], total_segments: 9 };
+        let f = Footer {
+            index_offset: 123,
+            index_len: 45,
+            index_hash: [1; 16],
+            uuid: [2; 16],
+            total_segments: 9,
+            index_gap: 0,
+        };
         assert_eq!(Footer::decode(&f.encode()).unwrap(), f);
     }
 }

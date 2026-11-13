@@ -120,8 +120,31 @@ fn zstd_decompress(stored: &[u8], raw_len: usize) -> Result<Vec<u8>> {
 #[cfg(not(feature = "zstd-native"))]
 fn zstd_decompress(stored: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     use std::io::Read;
-    let mut d = ruzstd::decoding::StreamingDecoder::new(stored).map_err(|e| Error::Corrupt(format!("zstd: {e}")))?;
+    let bad_frame = || Error::Corrupt("invalid or oversized zstd frame header".into());
+    let descriptor = *stored.get(4).ok_or_else(bad_frame)?;
+    let window = if descriptor & 0x20 == 0 {
+        let descriptor = *stored.get(5).ok_or_else(bad_frame)?;
+        let base = 1u64 << (10 + (descriptor >> 3));
+        base + (base / 8) * u64::from(descriptor & 7)
+    } else {
+        let dictionary_bytes = [0, 1, 2, 4][(descriptor & 3) as usize];
+        let size_bytes = [1, 2, 4, 8][(descriptor >> 6) as usize];
+        let start = 5 + dictionary_bytes;
+        let bytes = stored.get(start..start + size_bytes).ok_or_else(bad_frame)?;
+        let mut value = [0; 8];
+        value[..size_bytes].copy_from_slice(bytes);
+        let size = u64::from_le_bytes(value);
+        if size_bytes == 2 {
+            size + 256
+        } else {
+            size
+        }
+    };
+    if window > (64 << 20) || descriptor & 0x20 != 0 && window != raw_len as u64 {
+        return Err(bad_frame());
+    }
+    let d = ruzstd::decoding::StreamingDecoder::new(stored).map_err(|e| Error::Corrupt(format!("zstd: {e}")))?;
     let mut out = Vec::with_capacity(raw_len);
-    d.read_to_end(&mut out)?;
+    d.take(raw_len as u64 + 1).read_to_end(&mut out)?;
     Ok(out)
 }

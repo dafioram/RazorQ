@@ -14,6 +14,7 @@ use crate::index::*;
 use crate::progress::{Event, Progress};
 use crate::storage::{parallelism, pmap, read_vec, ReadAt};
 use rqz_ecc as ecc;
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -119,8 +120,11 @@ pub trait ArchiveSink: Read + Write + Seek {
     fn note_header(&mut self, _header: &[u8]) -> std::io::Result<()> {
         Ok(())
     }
-    /// The recovery region starts here: end the current volume at `pos` so that the tail
-    /// volumes hold only recovery data and the final index (losing one never loses data blocks).
+    /// Optionally start an index copy at the next volume boundary.
+    fn index_copy_boundary(&self, pos: u64) -> u64 {
+        pos
+    }
+    /// End the current volume before its recovery region.
     fn cut_here(&mut self, _pos: u64) -> std::io::Result<()> {
         Ok(())
     }
@@ -147,6 +151,7 @@ pub struct ArchiveWriter<'p, W: ArchiveSink> {
     set_first_block: usize,
     set_stored: u64,
     meta_pending: Vec<FileEntry>,
+    new_paths: HashMap<String, Option<u8>>,
     segments: u32,
     recovery_bytes: u64,
     stored_bytes: u64,
@@ -181,6 +186,7 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
             set_first_block: 0,
             set_stored: 0,
             meta_pending: Vec::new(),
+            new_paths: HashMap::new(),
             segments: 0,
             recovery_bytes: 0,
             stored_bytes: 0,
@@ -194,6 +200,12 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
     }
 
     pub fn create(mut w: W, opts: PackOptions, progress: &'p dyn Progress) -> Result<Self> {
+        if !opts.protect.ratio.is_finite()
+            || !(0.0..=3.0).contains(&opts.protect.ratio)
+            || opts.protect.min_repair > ecc::MAX_K
+        {
+            return Err(Error::Other("invalid recovery settings".into()));
+        }
         let tiny = opts.total_hint.map(|t| t < (1 << 20)).unwrap_or(false);
         let ss = opts.symbol_size.unwrap_or(if tiny { 1024 } else { 4096 });
         if ss < 64 || ss % 8 != 0 {
@@ -207,6 +219,8 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         }
         let mut h = Header::new(if tiny { HEADER_LEN_TINY } else { HEADER_LEN_NORMAL });
         h.uuid = if opts.deterministic { [0; 16] } else { random_bytes::<16>() };
+        h.feat_required |= REQ_CHECKPOINTS;
+        h.generation = 1;
         h.created_unix = if opts.deterministic { 0 } else { opts.now_unix.max(0) as u64 };
         h.block_log2 = opts.block_size.trailing_zeros() as u8;
         h.symbol_size = ss;
@@ -246,13 +260,34 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         opts: PackOptions,
         progress: &'p dyn Progress,
     ) -> Result<Self> {
+        Self::continue_archive(w, archive, opts, progress, true)
+    }
+
+    pub fn maintain<S: ReadAt>(w: W, archive: &Archive<S>, progress: &'p dyn Progress) -> Result<Self> {
+        Self::continue_archive(w, archive, PackOptions::default(), progress, false)
+    }
+
+    fn continue_archive<S: ReadAt>(
+        w: W,
+        archive: &Archive<S>,
+        opts: PackOptions,
+        progress: &'p dyn Progress,
+        snapshot: bool,
+    ) -> Result<Self> {
+        if !archive.has_complete_inventory() && !archive.locked {
+            return Err(Error::Corrupt("cannot update an archive with an incomplete inventory".into()));
+        }
         if archive.locked {
             return Err(Error::PasswordRequired);
         }
         if archive.header.detached() {
             return Err(Error::Unsupported("cannot append to a detached sidecar".into()));
         }
-        let mut me = Self::blank(w, archive.header.clone(), opts, archive.crypto().cloned(), progress);
+        let mut header = archive.header.clone();
+        header.feat_required |= REQ_CHECKPOINTS;
+        header.generation =
+            header.generation.checked_add(1).ok_or_else(|| Error::Other("too many archive generations".into()))?;
+        let mut me = Self::blank(w, header, opts, archive.crypto().cloned(), progress);
         me.index = archive.full_index();
         me.pos = archive.file_len();
         if let Some(b) = me.index.blocks.last() {
@@ -262,14 +297,42 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         me.set_id = me.index.sets.iter().map(|s| s.id + 1).max().unwrap_or(0);
         me.set_first_block = me.index.blocks.len();
         me.next_file_id = me.index.files.iter().map(|f| f.id + 1).max().unwrap_or(0);
-        me.snapshot = me.index.snapshots.iter().map(|s| s.id + 1).max().unwrap_or(1);
         me.segments = me.index.blocks.len() as u32;
-        me.index.snapshots.push(Snapshot {
-            id: me.snapshot,
-            created: me.opts.now_unix,
-            name: me.opts.snapshot_name.clone().unwrap_or_else(|| format!("snapshot {}", me.snapshot)),
-        });
+        if snapshot {
+            me.snapshot = me.index.snapshots.iter().map(|s| s.id + 1).max().unwrap_or(1);
+            if me.snapshot > 1_000_000 {
+                return Err(Error::Other("too many snapshots".into()));
+            }
+            me.index.snapshots.push(Snapshot {
+                id: me.snapshot,
+                created: me.opts.now_unix,
+                name: me.opts.snapshot_name.clone().unwrap_or_else(|| format!("snapshot {}", me.snapshot)),
+            });
+        }
         Ok(me)
+    }
+
+    #[cfg(feature = "fs")]
+    pub(crate) fn rebind_sidecar<S: ReadAt>(
+        w: W,
+        archive: &Archive<S>,
+        target_name: &str,
+        progress: &'p dyn Progress,
+    ) -> Result<Self> {
+        validate_member_path(target_name)?;
+        let mut index = archive.full_index();
+        let detached =
+            index.detached.as_mut().ok_or_else(|| Error::Other("archive is not a detached sidecar".into()))?;
+        detached.target_name = target_name.to_owned();
+        let mut header = archive.header.clone();
+        header.feat_required |= REQ_CHECKPOINTS;
+        header.generation =
+            header.generation.checked_add(1).ok_or_else(|| Error::Other("too many archive generations".into()))?;
+        let mut writer = Self::blank(w, header, PackOptions::default(), None, progress);
+        writer.set_first_block = index.blocks.len();
+        writer.index = index;
+        writer.pos = archive.file_len();
+        Ok(writer)
     }
 
     /// Start a detached sidecar that protects an existing file without touching it.
@@ -356,6 +419,22 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
 
     // ------------------------------------------------------------ adding data
 
+    fn register_path(&mut self, path: &str, kind: u8) -> Result<()> {
+        validate_member_path(path)?;
+        let key = if cfg!(windows) { path.to_lowercase() } else { path.to_owned() };
+        if self.new_paths.get(&key).is_some_and(|previous| previous.is_some() || kind != KIND_DIR) {
+            return Err(Error::Other(format!("duplicate archive path {path:?}")));
+        }
+        for (prefix, _) in key.match_indices('/') {
+            if self.new_paths.get(&key[..prefix]).is_some_and(|&kind| kind.is_some_and(|kind| kind != KIND_DIR)) {
+                return Err(Error::Other(format!("archive path has a non-directory parent: {path:?}")));
+            }
+            self.new_paths.entry(key[..prefix].to_owned()).or_insert(None);
+        }
+        self.new_paths.insert(key, Some(kind));
+        Ok(())
+    }
+
     fn new_entry(
         &mut self,
         path: &str,
@@ -387,6 +466,7 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
 
     /// Add a file whose bytes come from `r`. Returns the number of bytes stored.
     pub fn add_file<R: Read>(&mut self, path: &str, mode: u32, mtime: i64, r: &mut R) -> Result<u64> {
+        self.register_path(path, KIND_FILE)?;
         let skip = codec::looks_incompressible(path);
         let mut tmp = vec![0u8; 1 << 20];
         let mut total = 0u64;
@@ -409,11 +489,13 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
     }
 
     pub fn add_dir(&mut self, path: &str, mode: u32, mtime: i64) -> Result<()> {
+        self.register_path(path, KIND_DIR)?;
         self.dirs += 1;
         self.new_entry(path, KIND_DIR, 0, mode, mtime, None)
     }
 
     pub fn add_symlink(&mut self, path: &str, target: &str, mode: u32, mtime: i64) -> Result<()> {
+        self.register_path(path, KIND_SYMLINK)?;
         self.new_entry(path, KIND_SYMLINK, 0, mode, mtime, Some(target.to_string()))
     }
 
@@ -456,10 +538,14 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         let (codec_id, mut stored) =
             if all_skip { (codec::STORE, raw.clone()) } else { codec::compress(self.opts.compression, &raw) };
         let seq = self.next_seq;
-        let mut flags = flag::SYMCRC;
+        let raw_offset = self.stream_pos - raw.len() as u64;
+        if raw_offset >> 48 != 0 {
+            return Err(Error::Other("archive logical stream exceeds 256 TiB".into()));
+        }
+        let mut flags = flag::SYMCRC | flag::RAW_OFFSET;
         if let Some(c) = &self.crypto {
             stored = c.encrypt_block(seq, &stored);
-            flags |= flag::ENCRYPTED;
+            flags |= flag::ENCRYPTED | flag::RANDOM_NONCE;
         }
         let hash = hash128(&stored);
         let stored_len = stored.len() as u32;
@@ -476,11 +562,11 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
             flags,
             stored_len,
             raw_len: raw.len() as u32,
-            owner: 0,
+            owner: raw_offset as u32,
             seq,
             hash,
             set_id: self.set_id as u16,
-            stripe: 0,
+            stripe: (raw_offset >> 32) as u16,
         };
         let off = self.write_segment(&hdr, &payload)?;
         self.index.blocks.push(BlockEntry {
@@ -488,7 +574,7 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
             offset: off,
             stored_len,
             raw_len: raw.len() as u32,
-            raw_offset: self.stream_pos - raw.len() as u64,
+            raw_offset,
             codec: codec_id,
             flags,
             set_id: self.set_id,
@@ -529,20 +615,34 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         Ok(())
     }
 
-    fn write_index_segment(&mut self) -> Result<(u64, SegHeader)> {
+    fn write_index_segment(&mut self, final_index: bool) -> Result<(u64, SegHeader)> {
         let payload = self.index.to_bytes(self.crypto.as_ref());
-        let hdr = SegHeader {
+        if payload.len() > MAX_INDEX || u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize > MAX_INDEX {
+            return Err(Error::Other("archive index exceeds 64 MiB".into()));
+        }
+        let mut hdr = SegHeader {
             kind: kind::INDEX,
             codec: codec::LZ4,
             flags: 0,
             stored_len: payload.len() as u32,
             raw_len: 0,
-            owner: 0,
-            seq: 0,
+            owner: u32::from(final_index),
+            seq: self.header.generation,
             hash: hash128(&payload),
             set_id: 0,
             stripe: 0,
         };
+        if final_index {
+            crate::catalog::encode(&payload, self.header.generation, |h, data| {
+                self.write_segment(h, data)?;
+                Ok(())
+            })?;
+            hdr.kind = kind::INDEX_MIRROR;
+            self.write_segment(&hdr, &payload)?;
+            hdr.kind = kind::INDEX;
+            hdr.raw_len = u32::try_from(self.w.index_copy_boundary(self.pos) - self.pos).unwrap_or(0);
+            self.pos += u64::from(hdr.raw_len);
+        }
         let off = self.write_segment(&hdr, &payload)?;
         Ok((off, hdr))
     }
@@ -554,7 +654,9 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
             let b = &self.index.blocks[idx];
             (b.offset, b.stored_len as usize)
         };
-        let data_off = off + (SEG_HEADER_LEN + table_len(len, self.ss)) as u64;
+        let b = &self.index.blocks[idx];
+        let table = if b.flags & flag::SYMCRC != 0 { table_len(len, self.ss) } else { 0 };
+        let data_off = off + (SEG_HEADER_LEN + table) as u64;
         let mut v = vec![0u8; padded_len(len, self.ss)];
         match &self.target {
             Some(t) => t.read_exact_at(&mut v[..len], off)?,
@@ -562,6 +664,9 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
                 self.w.seek(SeekFrom::Start(data_off))?;
                 self.w.read_exact(&mut v[..len])?;
             }
+        }
+        if hash128(&v[..len]) != b.hash {
+            return Err(Error::BlockLost(b.seq));
         }
         Ok(v)
     }
@@ -587,12 +692,10 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
             let total_bytes: u64 = all.iter().map(|&i| syms(i) * ss as u64).sum();
             let avg = (total_bytes / all.len().max(1) as u64).max(1);
             let max_syms = all.iter().map(|&i| syms(i)).max().unwrap_or(1);
-            let lost_blocks = (self.opts.volume_size / avg + 2) * self.opts.survive_volumes as u64;
-            let need = lost_blocks.div_ceil(g_count as u64) * max_syms + 2;
+            let lost_blocks =
+                (self.opts.volume_size / avg).saturating_add(2).saturating_mul(self.opts.survive_volumes as u64);
+            let need = lost_blocks.div_ceil(g_count as u64).saturating_mul(max_syms).saturating_add(2);
             let floor = need as f64 / kmax.max(1) as f64 * 1.05;
-            if total_bytes <= self.opts.volume_size {
-                self.warnings.push("the whole archive fits in one volume, so there is no volume to lose".into());
-            }
             if floor > 1.0 && total_bytes > self.opts.volume_size {
                 self.warnings.push(format!(
                     "recovery data will be about {:.0}% of the archive because one volume is {:.0}% of it; smaller volumes need much less",
@@ -613,6 +716,9 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         let r = ecc::repair_count(kmax, ratio, protect.min_repair);
         if r == 0 || kmax == 0 {
             return Ok(None);
+        }
+        if kmax > ecc::MAX_K || start.checked_add(r).is_none_or(|end| end >= (1 << 24) - ecc::MAX_K) {
+            return Err(Error::Other("ECC group exceeds RaptorQ limits".into()));
         }
         let seg_len = (SEG_HEADER_LEN + ss) as u64;
         self.w.cut_here(self.pos)?;
@@ -693,20 +799,36 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         self.set_stored = 0;
         if checkpoint {
             self.flush_meta()?;
-            self.write_index_segment()?;
+            self.write_index_segment(false)?;
         }
         Ok(())
     }
 
     /// Top up redundancy of every protected set by `protect` (rateless codes make this cheap).
     pub fn add_protection(&mut self, protect: Protect) -> Result<u32> {
+        if !protect.ratio.is_finite() || !(0.0..=3.0).contains(&protect.ratio) || protect.min_repair > ecc::MAX_K {
+            return Err(Error::Other("invalid recovery settings".into()));
+        }
         self.progress.emit(Event::Stage("Adding recovery data".into()));
-        let sets: Vec<SetInfo> = self.index.sets.iter().filter(|s| s.stripe > 0).cloned().collect();
+        if protect.ratio == 0.0 {
+            return Ok(0);
+        }
         let mut added = 0;
-        for set in sets {
+        for i in 0..self.index.sets.len() {
+            let mut set = self.index.sets[i].clone();
+            if set.stripe == 0 {
+                let start = set.first_block as usize;
+                let end = start + set.block_count as usize;
+                let total = self.index.blocks[start..end]
+                    .iter()
+                    .map(|b| n_symbols(b.stored_len as usize, self.ss) as u64)
+                    .sum();
+                set.stripe = ecc::group_count(total, self.header.target_k).min(set.block_count);
+            }
             let have: u32 = self.index.regions.iter().filter(|r| r.set_id == set.id).map(|r| r.per_group).sum();
             if let Some(region) = self.write_set_recovery(&set, have, protect)? {
                 added += region.per_group * set.stripe;
+                self.index.sets[i].stripe = set.stripe;
                 self.index.regions.push(region);
             }
         }
@@ -719,19 +841,26 @@ impl<'p, W: ArchiveSink> ArchiveWriter<'p, W> {
         // still knows what its blocks are.
         self.flush_meta()?;
         self.close_set(false)?;
-        let (off, hdr) = self.write_index_segment()?;
+        let (off, hdr) = self.write_index_segment(true)?;
         let footer = Footer {
             index_offset: off,
             index_len: (SEG_HEADER_LEN as u32) + hdr.stored_len,
             index_hash: hdr.hash,
             uuid: self.header.uuid,
             total_segments: self.segments,
+            index_gap: hdr.raw_len,
         }
         .encode();
         self.w.seek(SeekFrom::Start(self.pos))?;
         self.w.write_all(&footer)?;
         self.w.write_all(&footer)?;
         self.pos += 2 * FOOTER_LEN as u64;
+        self.header.inventory = Some(self.index.inventory_hashes(self.crypto.as_ref()));
+        let header = self.header.encode();
+        self.w.note_header(&header)?;
+        self.w.seek(SeekFrom::Start(0))?;
+        self.w.write_all(&header)?;
+        self.w.write_all(&header)?;
         self.w.flush()?;
         let summary = Summary {
             files: self.files,

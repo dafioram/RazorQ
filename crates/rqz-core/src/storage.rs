@@ -108,6 +108,19 @@ impl ReadAt for std::fs::File {
     }
 }
 
+/// Read what is available and zero-fill unreadable chunks while preserving successful reads.
+pub(crate) fn read_lossy<S: ReadAt + ?Sized>(src: &S, offset: u64, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0; len];
+    if src.read_exact_at(&mut bytes, offset).is_err() {
+        for (i, chunk) in bytes.chunks_mut(4096).enumerate() {
+            if src.read_exact_at(chunk, offset + i as u64 * 4096).is_err() {
+                chunk.fill(0);
+            }
+        }
+    }
+    bytes
+}
+
 pub fn read_vec<S: ReadAt + ?Sized>(s: &S, offset: u64, len: usize) -> io::Result<Vec<u8>> {
     let mut v = vec![0u8; len];
     s.read_exact_at(&mut v, offset)?;

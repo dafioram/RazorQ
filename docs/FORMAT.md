@@ -16,8 +16,9 @@ Conventions: little-endian integers, absolute `u64` offsets, **CRC32C** for stru
 [Footer B  64 B]      mirror
 ```
 
-`add` appends new segments after the old footers, then a fresh index and footers. Old footers stay valid,
-so every earlier state of the archive is still a consistent point in time (that is what snapshots are).
+`add` appends to a staged copy and updates both header copies to commit the new index generation.
+Old indexes can aid salvage. The reader verifies the generation and inventory before treating an
+index as complete.
 
 ## 2. Header
 
@@ -39,9 +40,13 @@ so every earlier state of the archive is still a consistent point in time (that 
 | 76 | … | TLV tail: `tag u16, len u16, bytes`; tag 0 ends it |
 | last 4 | 4 | CRC32C of everything before it |
 
-TLV tags: `1` writer string, `2` KDF (salt 16, m_kib u32, t u32, lanes u32), `3` key check (16 B).
+TLV tags: `1` writer string, `2` KDF (salt 16, m_kib u32, t u32, lanes u32), `3` key check (16 B),
+`4` committed generation (u64), `5` committed inventory (16-byte block table hash followed by
+16-byte file table hash). The hashes cover the fixed-integer bincode table encodings. The encrypted
+file table uses keyed BLAKE3 with the domain string `rqz-file-inventory-v1` before the table bytes.
 
-Feature bits. Required: `0` encrypted, `1` detached sidecar. Optional: `0` tiny profile.
+Required feature bits: `0` encrypted, `1` detached sidecar, `2` committed inventory and final index.
+Optional bit `0` denotes the tiny profile.
 
 If header A is damaged, the reader tries a mirror at offset 512 and then 4096.
 
@@ -53,9 +58,9 @@ boundaries after damage, and every segment is self-describing.
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | sync `D3 'R' 'Q' 'S' A5 5A C3 3C` |
-| 8 | 1 | kind: 0 data · 1 recovery · 2 index · 3 dict (reserved) · 4 symbol-CRC table · 5 file metadata |
+| 8 | 1 | kind: 0 data · 1 recovery · 2 index · 3 dict (reserved) · 4 symbol-CRC table · 5 file metadata · 6 final index mirror · 7 protected catalog symbol |
 | 9 | 1 | codec: 0 store · 1 zstd · 2 lz4 |
-| 10 | 2 | flags: 1 encrypted · 2 dedup ref (reserved) · 4 has symbol CRCs |
+| 10 | 2 | flags: 1 encrypted · 2 dedup ref (reserved) · 4 has symbol CRCs · 8 random block nonce · 16 absolute logical block offset |
 | 12 | 4 | `stored_len` |
 | 16 | 4 | `raw_len` |
 | 20 | 4 | `owner`: group id (recovery) |
@@ -64,6 +69,9 @@ boundaries after damage, and every segment is self-describing.
 | 48 | 2 | `set_id` |
 | 50 | 2 | `stripe`: group count of the set (recovery segments) |
 | 52 | 4 | CRC32C of bytes 0..52 |
+
+For data segments with flag 16, `owner` contains the low 32 bits of the logical block offset and
+`stripe` the next 16 bits. This preserves the location of later files after a segment header is lost.
 
 The payload hash covers stored bytes, i.e. *after* compression and encryption. That is why check and
 repair work without the password and never see plaintext.
@@ -128,28 +136,39 @@ An index segment holds an lz4-compressed (size-prefixed) TLV stream. Each sectio
 | 6 | detached info (target name, length, CRC-segment offset) |
 
 Because only the file table is encrypted, `check` and `repair` work without a password.
-The index is written as a full copy after every ECC set (a checkpoint) and again at the end.
+The writer emits intermediate indexes with `owner=0`. The final index and mirror have `owner=1`
+and `seq` set to the committed generation. Both final copies contain the same compressed bytes.
+
+### Protected catalog
+
+Before the two final index copies, kind-7 segments independently encode the compressed index.
+Each payload is the 16-byte BLAKE3 digest of the complete compressed index followed by a 4096-byte
+symbol. The segment hash covers that entire payload. Groups use up to 64 source symbols, followed
+by 25% RaptorQ repair symbols with a minimum of four. The final source symbol is zero-padded.
+The flags are 0 for a systematic symbol and 1 for a repair symbol. `raw_len` is the complete
+compressed index length, `owner` the symbol ID, `seq` the generation, `set_id` the zero-based group,
+and `stripe` the source symbol count. The reader verifies the decoded catalog digest and the committed
+inventory before using it. This catalog is separate from the user-selected data recovery ratio.
 
 ## 6. Footer
 
 64 bytes, written twice: magic `89 'R' 'Q' 'F' 0D 0A 1A 0A`, `index_offset u64`, `index_len u32`,
-`index_hash 16`, UUID 16, `total_segments u32`, reserved 4, CRC32C 4.
+`index_hash 16`, UUID 16, `total_segments u32`, `index_gap u32`, CRC32C 4. The mirror starts at
+`index_offset - index_len - index_gap`.
 
 ## 7. Open path
 
-Each step is slower than the one before and each one works:
+1. Read the header copies, preferring the valid copy with the highest committed generation.
+2. Check both footers and both final index copies.
+3. Search backward for a final index matching the committed generation and inventory.
+4. Scan for the protected catalog and verify the reconstructed index.
+5. Salvage block and file metadata from surviving segments. Rebuilding a complete index requires
+   matching the header’s inventory. An incomplete scan remains damaged and can still yield identifiable files.
 
-1. Header A (else mirror B).
-2. Footer A, then footer B → load the index at `index_offset`, verify its hash.
-3. Scan backwards for the newest valid index segment.
-4. Scan forwards, following sync patterns, and rebuild blocks, sets, recovery locations and the file
-   table from segment headers and metadata segments.
-
-When the source is known to be incomplete (a missing volume), step 3 is skipped: an older checkpoint would
-silently describe an earlier state of the archive.
-
-`repair` rewrites a damaged header or footer from its mirror and, after step 3 or 4, appends a fresh
-index and footers.
+A locked archive can verify stored bytes and reconstruct an intact sealed index. Unlocking lets the
+reader verify the file table and decoded file data. Older 0.1 archives without a committed inventory
+can be opened with an intact footer and index. Recovery from older checkpoints without that evidence
+is treated as salvage.
 
 ## 8. Detached sidecars (`.rqzp`)
 
@@ -190,17 +209,15 @@ Layout rules (so a lost volume's size can always be derived from its neighbours)
   header copy in any other volume, and repair writes them back.
 * A split archive is **one ECC set**, so recovery data is striped across every volume.
 
-**Sizing.** With `--volume-size V --survive-volumes N` the writer sizes recovery data so that any
-`N` whole volumes can vanish. Erasures are quantised by block (a lost volume also clips a block at
-each end), so it works in blocks per group: `need = ceil(N * (V / avg_block + 2) / G) * symbols_per_block + 2`
-repair symbols per group, ×1.05, capped at 300%. It warns when recovery data would exceed the archive
-itself, which happens when volumes are a large fraction of it.
+Each volume header also stores the complete logical length. The low 32 bits are at offset 44 and
+the high 32 bits at offset 68. A legacy zero length uses the last available part as a fallback.
+Volume geometry and header copies must agree before the reader assembles the address space.
 
-**Repair** recreates missing volumes (header rebuilt from neighbours, payload patched with regenerated
-blocks and recovery symbols) and writes a complete repaired set to a new folder; originals stay untouched.
-If the *last* volume is lost, the index is rebuilt by scanning (a stale checkpoint is never trusted when
-volumes are missing) and a fresh index and footers are appended; only recovery data is lost, which
-`add-protection` on a single file can top up.
+`--volume-size V` limits the total bytes of every part, including its header. An optional
+`--survive-volumes N` increases data parity using a bounded sizing heuristic. The value is a
+target. Actual repairability is determined from available metadata, decoding, and verification
+of affected blocks. A repaired copy is staged before publication. The index mirror can be moved
+to the next part boundary when the gap is at most 1 MiB.
 
 ## 10. Browsing: mount and serve
 
@@ -211,8 +228,9 @@ FUSE (Linux). `rqz serve` exposes it as read-only WebDAV (class 1: `OPTIONS`, `G
 
 ## 11. Encryption
 
-Argon2id (64 MiB, t=3) → 32-byte key → XChaCha20-Poly1305. Blocks use a nonce derived from the block
-sequence number with `uuid || seq` as associated data; metadata and the file table use random nonces.
+Argon2id (64 MiB, t=3) → 32-byte key → XChaCha20-Poly1305. New encrypted blocks prepend a random
+24-byte nonce with `uuid || seq` as associated data. Earlier blocks without flag 8 retain their
+sequence-derived nonce. Metadata and the file table use random nonces.
 Encryption happens **before** hashing and erasure coding.
 
 ## 12. Versioning

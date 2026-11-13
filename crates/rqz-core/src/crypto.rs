@@ -29,6 +29,9 @@ impl Crypto {
     }
 
     pub fn derive(password: &str, kdf: &Kdf, uuid: [u8; 16]) -> Result<Crypto> {
+        if kdf.m_kib > 256 * 1024 || kdf.t_cost > 10 || kdf.lanes > 8 {
+            return Err(Error::Unsupported("archive KDF exceeds the reader work limit".into()));
+        }
         let params = argon2::Params::new(kdf.m_kib, kdf.t_cost, kdf.lanes, Some(32))
             .map_err(|e| Error::Other(format!("bad KDF parameters: {e}")))?;
         let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
@@ -36,6 +39,13 @@ impl Crypto {
         a.hash_password_into(password.as_bytes(), &kdf.salt, &mut key)
             .map_err(|e| Error::Other(format!("key derivation failed: {e}")))?;
         Ok(Crypto { key, uuid })
+    }
+
+    pub(crate) fn inventory_hash(&self, bytes: &[u8]) -> [u8; 16] {
+        let mut h = blake3::Hasher::new_keyed(&self.key);
+        h.update(b"rqz-file-inventory-v1");
+        h.update(bytes);
+        h.finalize().as_bytes()[..16].try_into().unwrap()
     }
 
     /// Lets us tell a wrong password from corruption without revealing the key.
@@ -57,14 +67,26 @@ impl Crypto {
         a
     }
 
-    /// Block encryption: nonce derived from the block's sequence number. The key
-    /// is unique per archive and sequence numbers never repeat, so nonces are unique.
+    /// Random block nonces remain unique when copies of the same archive are appended independently.
     pub fn encrypt_block(&self, seq: u64, data: &[u8]) -> Vec<u8> {
-        let mut n = [0u8; NONCE_LEN];
-        n[..8].copy_from_slice(&seq.to_le_bytes());
+        let nonce = random_bytes::<NONCE_LEN>();
+        let mut out = nonce.to_vec();
+        out.extend(
+            self.cipher()
+                .encrypt(XNonce::from_slice(&nonce), Payload { msg: data, aad: &self.aad(seq) })
+                .expect("encryption cannot fail"),
+        );
+        out
+    }
+
+    pub fn decrypt_random_block(&self, seq: u64, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < NONCE_LEN + TAG_LEN {
+            return Err(Error::Corrupt("encrypted block is too short".into()));
+        }
+        let (nonce, ciphertext) = data.split_at(NONCE_LEN);
         self.cipher()
-            .encrypt(XNonce::from_slice(&n), Payload { msg: data, aad: &self.aad(seq) })
-            .expect("encryption cannot fail")
+            .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad: &self.aad(seq) })
+            .map_err(|_| Error::Corrupt("block failed authentication".into()))
     }
 
     pub fn decrypt_block(&self, seq: u64, data: &[u8]) -> Result<Vec<u8>> {
@@ -107,8 +129,9 @@ mod tests {
         let kdf = Kdf { salt: [3; 16], m_kib: 64, t_cost: 1, lanes: 1 };
         let c = Crypto::derive("pw", &kdf, [1; 16]).unwrap();
         let e = c.encrypt_block(5, b"hello");
-        assert_eq!(c.decrypt_block(5, &e).unwrap(), b"hello");
-        assert!(c.decrypt_block(6, &e).is_err());
+        assert_eq!(c.decrypt_random_block(5, &e).unwrap(), b"hello");
+        assert!(c.decrypt_random_block(6, &e).is_err());
+        assert_ne!(&e[..NONCE_LEN], &c.encrypt_block(5, b"hello")[..NONCE_LEN]);
         assert_eq!(c.open(&c.seal(b"meta")).unwrap(), b"meta");
         let other = Crypto::derive("nope", &kdf, [1; 16]).unwrap();
         assert_ne!(c.key_check(), other.key_check());

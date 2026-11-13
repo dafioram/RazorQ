@@ -15,7 +15,7 @@
 
 use crate::archive::Patch;
 use crate::error::{Error, Result};
-use crate::format::crc;
+use crate::format::{crc, Header};
 use crate::storage::{read_vec, ReadAt};
 use std::collections::BTreeMap;
 use std::io;
@@ -23,6 +23,7 @@ use std::io;
 pub const VOL_MAGIC: [u8; 8] = [0x89, b'R', b'Q', b'V', 0x0D, 0x0A, 0x1A, 0x0A];
 pub const VOL_FIXED: usize = 80;
 pub const NO_CUT: u32 = u32::MAX;
+const MAX_VOLUMES: u32 = 100_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolHeader {
@@ -33,6 +34,7 @@ pub struct VolHeader {
     pub cut_index: u32,
     pub cut_len: u64,
     pub payload_len: u64,
+    pub total_len: u64,
     /// Copy of the archive header (self-checking).
     pub arch_header: Vec<u8>,
 }
@@ -49,6 +51,9 @@ impl VolHeader {
         b[48..56].copy_from_slice(&self.cut_len.to_le_bytes());
         b[56..64].copy_from_slice(&self.payload_len.to_le_bytes());
         b[64..68].copy_from_slice(&(self.arch_header.len() as u32).to_le_bytes());
+        let total = self.total_len.to_le_bytes();
+        b[44..48].copy_from_slice(&total[..4]);
+        b[68..72].copy_from_slice(&total[4..]);
         let c = crc(&b[..72]);
         b[72..76].copy_from_slice(&c.to_le_bytes());
         b.extend_from_slice(&self.arch_header);
@@ -80,6 +85,7 @@ impl VolHeader {
                 cut_index: u32_at(40),
                 cut_len: u64_at(48),
                 payload_len: u64_at(56),
+                total_len: u64::from(u32_at(44)) | (u64::from(u32_at(68)) << 32),
                 arch_header: Vec::new(),
             },
             copy_len,
@@ -150,6 +156,8 @@ pub struct VolumeSet {
     /// For each volume, which input part supplied it.
     pub supplied: Vec<Option<usize>>,
     notes: Vec<String>,
+    total_len: u64,
+    short: bool,
 }
 
 impl VolumeSet {
@@ -163,6 +171,28 @@ impl VolumeSet {
                 let fixed = read_vec(&part, 0, VOL_FIXED).ok()?;
                 let (mut h, copy_len) = VolHeader::decode_fixed(&fixed)?;
                 h.arch_header = read_vec(&part, VOL_FIXED as u64, copy_len).ok()?;
+                let archive = Header::decode(&h.arch_header).ok()?;
+                if archive.uuid != h.uuid
+                    || h.count == 0
+                    || h.count > MAX_VOLUMES
+                    || h.index >= h.count
+                    || h.std_len == 0
+                    || h.std_len.checked_mul(u64::from(h.count)).is_none()
+                    || h.std_len > u64::MAX - (VOL_FIXED + h.arch_header.len()) as u64
+                    || (h.cut_index != NO_CUT && (h.cut_index >= h.count || h.cut_len == 0 || h.cut_len >= h.std_len))
+                {
+                    return None;
+                }
+                let l = Layout { std_len: h.std_len, cut_index: h.cut_index, cut_len: h.cut_len, count: h.count };
+                if h.payload_len > l.cap(h.index)
+                    || (h.index + 1 != h.count && h.payload_len != l.cap(h.index))
+                    || (h.total_len != 0
+                        && (h.total_len < l.start(h.count - 1)
+                            || h.total_len > l.start(h.count)
+                            || (h.index + 1 == h.count && h.total_len != l.start(h.index) + h.payload_len)))
+                {
+                    return None;
+                }
                 Some(h)
             })();
             match parsed {
@@ -174,14 +204,19 @@ impl VolumeSet {
         if found.iter().any(|f| f.0.uuid != first.uuid) {
             return Err(Error::Other("these volumes belong to different archives".into()));
         }
-        let reference = found.iter().map(|f| &f.0).max_by_key(|h| h.count).unwrap().clone();
-        let highest = found.iter().map(|f| f.0.index + 1).max().unwrap();
-        let count = reference.count.max(highest);
-        let layout =
-            Layout { std_len: reference.std_len, cut_index: reference.cut_index, cut_len: reference.cut_len, count };
-        if layout.std_len == 0 {
-            return Err(Error::Corrupt("volume header has no volume size".into()));
+        if found.iter().any(|(h, _, _)| {
+            h.count != first.count
+                || h.std_len != first.std_len
+                || h.cut_index != first.cut_index
+                || h.cut_len != first.cut_len
+                || h.total_len != first.total_len
+                || h.arch_header != first.arch_header
+        }) {
+            return Err(Error::Corrupt("volume headers disagree about archive layout".into()));
         }
+        let count = first.count;
+        let layout = Layout { std_len: first.std_len, cut_index: first.cut_index, cut_len: first.cut_len, count };
+        let mut short = false;
         let mut slots: Vec<Option<Box<dyn ReadAt>>> = (0..count).map(|_| None).collect();
         let mut payload = vec![0u64; count as usize];
         let mut supplied = vec![None; count as usize];
@@ -190,6 +225,10 @@ impl VolumeSet {
             if slots[i].is_some() {
                 notes.push(format!("volume {} appears twice; using the first copy", h.index + 1));
                 continue;
+            }
+            if part.len()? < (VOL_FIXED + h.arch_header.len()) as u64 + h.payload_len {
+                notes.push(format!("volume {} of {} is truncated", h.index + 1, count));
+                short = true;
             }
             payload[i] = h.payload_len;
             supplied[i] = Some(pos);
@@ -209,6 +248,8 @@ impl VolumeSet {
             uuid: first.uuid,
             supplied,
             notes,
+            total_len: first.total_len,
+            short,
         })
     }
 
@@ -249,21 +290,32 @@ impl VolumeSet {
             }
         }
         let new_count = l.count.max(per.keys().max().map(|m| m + 1).unwrap_or(0));
+        let new_len = patches.iter().map(|p| p.offset + p.data.len() as u64).max().unwrap_or(0).max(self.total_len);
+        // Legacy sets have no declared total length. Keep that encoding until a new tail is written.
+        let new_len = if new_count == l.count && self.total_len == 0 { 0 } else { new_len };
+
         let mut out = Vec::new();
         for i in 0..new_count {
             let present = i < l.count && self.parts[i as usize].is_some();
             let patches = per.remove(&i).unwrap_or_default();
             let declared = if present { self.payload[i as usize] } else { 0 };
             let ext = extent.get(&i).copied().unwrap_or(0);
-            let payload = if present {
+            let payload = if i + 1 == new_count && new_len != 0 {
+                new_len - l.start(i)
+            } else if present {
                 declared.max(ext)
             } else if i == new_count - 1 {
                 ext
             } else {
                 l.cap(i)
             };
-            let header_changed = !present || payload != declared || new_count != l.count;
-            if present && patches.is_empty() && !header_changed {
+            let header_changed = !present || payload != declared || new_count != l.count || new_len != self.total_len;
+            let short = present
+                && self.parts[i as usize]
+                    .as_ref()
+                    .and_then(|p| p.len().ok())
+                    .is_some_and(|len| len < self.vh_len + payload);
+            if present && patches.is_empty() && !header_changed && !short {
                 continue;
             }
             let header = header_changed.then(|| {
@@ -275,6 +327,7 @@ impl VolumeSet {
                     cut_index: l.cut_index,
                     cut_len: l.cut_len,
                     payload_len: payload,
+                    total_len: new_len,
                     arch_header: self.arch_header.clone(),
                 }
                 .encode()
@@ -315,6 +368,9 @@ impl ReadAt for VolumeSet {
     }
 
     fn len(&self) -> io::Result<u64> {
+        if self.total_len != 0 {
+            return Ok(self.total_len);
+        }
         let h = (0..self.layout.count).rev().find(|&i| self.parts[i as usize].is_some());
         match h {
             Some(h) => Ok(self.layout.start(h) + self.payload[h as usize]),
@@ -327,7 +383,7 @@ impl ReadAt for VolumeSet {
     }
 
     fn is_incomplete(&self) -> bool {
-        self.parts.iter().any(|p| p.is_none())
+        self.short || self.parts.iter().any(|p| p.is_none())
     }
 }
 
@@ -366,6 +422,7 @@ pub fn split_archive_bytes(archive: &[u8], volume_size: u64) -> Result<Vec<Vec<u
             cut_index: layout.cut_index,
             cut_len: layout.cut_len,
             payload_len: end - start,
+            total_len: total,
             arch_header: header.clone(),
         };
         let mut v = h.encode();
@@ -383,7 +440,6 @@ pub use writer_impl::{volume_file_name, VolumeWriter};
 #[cfg(feature = "fs")]
 mod writer_impl {
     use super::*;
-    use crate::format::Header;
     use crate::writer::ArchiveSink;
     use std::collections::HashMap;
     use std::fs::{File, OpenOptions};
@@ -439,6 +495,9 @@ mod writer_impl {
         }
 
         fn file(&mut self, i: u32) -> io::Result<&mut File> {
+            if i >= MAX_VOLUMES {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many volumes"));
+            }
             if !self.files.contains_key(&i) {
                 if self.files.len() >= 48 {
                     let victim = *self.files.keys().find(|&&k| k != i).unwrap();
@@ -456,6 +515,7 @@ mod writer_impl {
                         cut_index: NO_CUT,
                         cut_len: 0,
                         payload_len: 0,
+                        total_len: 0,
                         arch_header: self.arch_header.clone(),
                     };
                     f.write_all(&h.encode())?;
@@ -469,6 +529,9 @@ mod writer_impl {
         pub fn finalize(mut self) -> io::Result<(Vec<PathBuf>, Layout)> {
             let (last_idx, last_off) = self.layout(0).locate(self.end);
             let count = if last_off == 0 && self.end > 0 { last_idx } else { last_idx + 1 }.max(1);
+            if count > MAX_VOLUMES {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "too many volumes"));
+            }
             let layout = self.layout(count);
             let mut paths = Vec::new();
             for i in 0..count {
@@ -481,6 +544,7 @@ mod writer_impl {
                     cut_index: layout.cut_index,
                     cut_len: layout.cut_len,
                     payload_len: payload,
+                    total_len: self.end,
                     arch_header: self.arch_header.clone(),
                 };
                 let vh = self.vh_len;
@@ -509,6 +573,17 @@ mod writer_impl {
             }
             self.std_len = self.target_len - self.vh_len;
             Ok(())
+        }
+
+        fn index_copy_boundary(&self, pos: u64) -> u64 {
+            let l = self.layout(0);
+            let (part, offset) = l.locate(pos);
+            let gap = l.cap(part) - offset;
+            if offset != 0 && gap <= 1 << 20 {
+                pos + gap
+            } else {
+                pos
+            }
         }
 
         fn cut_here(&mut self, pos: u64) -> io::Result<()> {
@@ -641,6 +716,7 @@ mod tests {
             cut_index: NO_CUT,
             cut_len: 0,
             payload_len: 900,
+            total_len: 0,
             arch_header: vec![7; 512],
         };
         let b = h.encode();

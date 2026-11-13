@@ -193,7 +193,12 @@ fn index_fallbacks_all_work() {
     let mut b3 = b2;
     let mut at = 0usize;
     while at + 8 < b3.len() {
-        if b3[at..at + 8] == rqz_core::format::SYNC && b3[at + 8] == rqz_core::format::kind::INDEX {
+        if b3[at..at + 8] == rqz_core::format::SYNC
+            && matches!(
+                b3[at + 8],
+                rqz_core::format::kind::INDEX | rqz_core::format::kind::INDEX_MIRROR | rqz_core::format::kind::CATALOG
+            )
+        {
             b3[at + 60] ^= 0xFF; // corrupt the payload so its hash fails
             at += 100;
         } else {
@@ -412,4 +417,94 @@ fn deterministic_output_is_identical() {
     let mut o = small_opts();
     o.deterministic = true;
     assert_eq!(build(&files, o.clone()), build(&files, o));
+}
+
+#[test]
+fn missing_inventory_never_becomes_a_healthy_empty_archive() {
+    use rqz_core::format::{kind, SegHeader, SEG_HEADER_LEN, SYNC};
+    let mut bad = build(&[("keep.txt".into(), vec![5; 8192])], small_opts());
+    for i in 0..bad.len() - SEG_HEADER_LEN {
+        if bad[i..].starts_with(&SYNC) {
+            if let Some(h) = SegHeader::decode(&bad[i..]) {
+                if matches!(h.kind, kind::INDEX | kind::INDEX_MIRROR | kind::META | kind::CATALOG) {
+                    bad[i + SEG_HEADER_LEN] ^= 1;
+                }
+            }
+        }
+    }
+    let a = open(bad);
+    assert_eq!(a.assess(&Quiet).health, Health::Damaged);
+    assert!(a.plan_repair(&a.assess(&Quiet), None, &Quiet).notes.iter().any(|n| n.contains("inventory")));
+}
+
+#[test]
+fn loss_of_latest_index_does_not_roll_back_a_snapshot() {
+    use rqz_core::format::{Footer, FOOTER_LEN};
+    let original = build(&[("old.txt".into(), b"old".to_vec())], small_opts());
+    let a = open(original.clone());
+    let mut w = ArchiveWriter::append(Cursor::new(original), &a, small_opts(), &Quiet).unwrap();
+    w.add_bytes("new.txt", 0o644, 0, b"new").unwrap();
+    let mut current = w.finish().unwrap().0.into_inner();
+    let footer = Footer::decode(&current[current.len() - FOOTER_LEN..]).unwrap();
+    current.truncate((footer.index_offset - u64::from(footer.index_len)) as usize);
+    let a = open(current);
+    assert_eq!(a.opened_via, OpenPath::CatalogRecovery);
+    assert_eq!(a.read_file(a.visible_files(None).into_iter().find(|f| f.path == "new.txt").unwrap()).unwrap(), b"new");
+    assert_eq!(a.assess(&Quiet).health, Health::Repairable);
+}
+
+#[test]
+fn protected_catalog_recovers_an_encrypted_index_without_the_password() {
+    use rqz_core::format::{kind, Footer, SegHeader, FOOTER_LEN, SEG_HEADER_LEN, SYNC};
+    let files = vec![("private.txt".into(), vec![7; 8192])];
+    let mut opts = small_opts();
+    opts.password = Some("fixture".into());
+    let mut image = build(&files, opts);
+    let footer = Footer::decode(&image[image.len() - FOOTER_LEN..]).unwrap();
+    let mirror = footer.index_offset - u64::from(footer.index_len);
+    let catalog = (0..mirror as usize)
+        .find(|&i| {
+            image[i..].starts_with(&SYNC) && SegHeader::decode(&image[i..]).is_some_and(|h| h.kind == kind::CATALOG)
+        })
+        .unwrap();
+    image[catalog + SEG_HEADER_LEN] ^= 1;
+    let degraded = Archive::open(&image, None).unwrap();
+    assert_eq!(degraded.assess(&Quiet).health, Health::Repairable);
+    assert!(degraded.notes.iter().any(|note| note.contains("catalog is damaged")));
+    let tail = image.len();
+    image[mirror as usize..tail].fill(0);
+    let locked = open(image.clone());
+    assert_eq!(locked.opened_via, OpenPath::CatalogRecovery);
+    let status = locked.assess(&Quiet);
+    assert!(status.stored_bytes_only);
+    assert_eq!(status.health, Health::Repairable);
+    let plan = locked.plan_repair(&status, None, &Quiet);
+    apply_patches_to_vec(&mut image, &plan.patches);
+    let unlocked = Archive::open(image, Some("fixture")).unwrap();
+    assert_contents(&unlocked, &files);
+    assert!(unlocked.assess(&Quiet).is_healthy());
+}
+
+#[test]
+fn independent_encrypted_appends_use_distinct_nonces() {
+    use rqz_core::crypto::NONCE_LEN;
+    use rqz_core::format::{table_len, SEG_HEADER_LEN};
+    let mut opts = small_opts();
+    opts.password = Some("fixture".into());
+    let original = build(&[("old.txt".into(), b"initial".to_vec())], opts.clone());
+    let old = Archive::open(&original, Some("fixture")).unwrap();
+    let append = |data: &[u8]| {
+        let mut writer = ArchiveWriter::append(Cursor::new(original.clone()), &old, opts.clone(), &Quiet).unwrap();
+        writer.add_bytes("new.txt", 0o644, 0, data).unwrap();
+        writer.finish().unwrap().0.into_inner()
+    };
+    let first = Archive::open(append(b"first version"), Some("fixture")).unwrap();
+    let second = Archive::open(append(b"other version"), Some("fixture")).unwrap();
+    let nonce = |archive: &Archive<Vec<u8>>| {
+        let block = archive.index.blocks.last().unwrap();
+        let start =
+            block.offset as usize + SEG_HEADER_LEN + table_len(block.stored_len as usize, archive.symbol_size());
+        archive.source()[start..start + NONCE_LEN].to_vec()
+    };
+    assert_ne!(nonce(&first), nonce(&second));
 }
