@@ -651,10 +651,10 @@ fn stage_repair_volumes(set: &VolumeSet, src: &Source, patches: &[Patch], stage:
             f.write_all(&p.data)?;
         }
         f.set_len(set.vh_len + rw.payload_len)?;
-        f.sync_all()?;
     }
+    // Flush both copied and reconstructed parts. On Windows, FlushFileBuffers needs write access.
     for path in volume_siblings(&stage.join(volume_file_name(base, 0))) {
-        File::open(path)?.sync_all()?;
+        OpenOptions::new().read(true).write(cfg!(windows)).open(path)?.sync_all()?;
     }
     Ok(stage.join(volume_file_name(base, 0)))
 }
