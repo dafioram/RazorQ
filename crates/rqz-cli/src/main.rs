@@ -57,7 +57,7 @@ struct WriteFlags {
     /// Split into volumes of this size, e.g. 700M or 4G (binary units)
     #[arg(long)]
     volume_size: Option<String>,
-    /// With --volume-size: size recovery data so this many whole volumes can be lost (default 1)
+    /// With --volume-size: use this missing-volume target to size recovery data (best effort)
     #[arg(long)]
     survive_volumes: Option<u32>,
     /// Block size in KiB (advanced)
@@ -112,7 +112,7 @@ enum Cmd {
         with: Option<PathBuf>,
         #[arg(short, long)]
         output: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         in_place: bool,
         #[arg(long)]
         force: bool,
@@ -356,7 +356,7 @@ fn pack_options(w: &WriteFlags) -> Result<PackOptions> {
     o.symbol_size = w.symbol_size;
     if let Some(v) = &w.volume_size {
         o.volume_size = parse_size(v)?;
-        o.survive_volumes = w.survive_volumes.unwrap_or(1);
+        o.survive_volumes = w.survive_volumes.unwrap_or(0);
     } else if w.survive_volumes.is_some() {
         bail!("--survive-volumes needs --volume-size");
     }
@@ -464,7 +464,7 @@ fn run(cli: Cli) -> Result<i32> {
             if json {
                 println!(
                     "{}",
-                    json!({"files": rep.files, "bytes": rep.bytes, "lost": rep.lost, "skipped": rep.skipped, "repaired_groups": rep.healed_groups})
+                    json!({"files": rep.files, "bytes": rep.bytes, "lost": rep.lost, "skipped": rep.skipped, "repaired_groups": rep.healed_groups, "inventory_complete": rep.inventory_complete})
                 );
             } else {
                 if rep.healed_groups > 0 {
@@ -474,6 +474,9 @@ fn run(cli: Cli) -> Result<i32> {
                     );
                 }
                 println!("  {} files extracted ({})", commas(rep.files as usize), human(rep.bytes));
+                if !rep.inventory_complete {
+                    println!("  ⚠ incomplete file inventory: recovered only the files still identifiable");
+                }
                 for s in &rep.skipped {
                     println!("  skipped: {s}");
                 }
@@ -485,7 +488,7 @@ fn run(cli: Cli) -> Result<i32> {
                     println!("  Next: rqz repair {} --with <another copy>", archive.display());
                 }
             }
-            Ok(if !rep.lost.is_empty() {
+            Ok(if !rep.lost.is_empty() || !rep.skipped.is_empty() || !rep.inventory_complete {
                 2
             } else if rep.healed_groups > 0 {
                 1
@@ -496,6 +499,11 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Ls { archive, snapshot, long } => {
             let pw = password_for_read(&archive, true)?;
             let a = Archive::open(Source::open(&archive)?, pw.as_deref())?;
+            if let Some(id) = snapshot {
+                if !a.index.snapshots.iter().any(|snapshot| snapshot.id == id) {
+                    bail!("unknown snapshot {id}");
+                }
+            }
             let files = a.visible_files(snapshot);
             if json {
                 let v: Vec<_> = files.iter().map(|f| json!({"path": f.path, "size": f.size, "kind": f.kind, "mode": f.mode, "mtime": f.mtime, "snapshot": f.snapshot})).collect();
@@ -520,7 +528,12 @@ fn run(cli: Cli) -> Result<i32> {
                     }
                 }
             }
-            Ok(0)
+            if !a.has_complete_inventory() {
+                eprintln!("warning: the file inventory is incomplete");
+                Ok(2)
+            } else {
+                Ok(0)
+            }
         }
         Cmd::Check { archive, target } => {
             let pw = password_for_read(&archive, false)?;
@@ -537,6 +550,7 @@ fn run(cli: Cli) -> Result<i32> {
                         "blocks": asm.blocks_total, "damaged_blocks": asm.blocks_damaged,
                         "headroom_ratio": asm.min_headroom_ratio, "headroom_symbols": asm.min_headroom_symbols,
                         "structural": asm.structural, "bad_groups": groups,
+                        "inventory_complete": asm.inventory_complete, "stored_bytes_only": asm.stored_bytes_only,
                         "opened_via": info.opened_via.describe(),
                     })
                 );
@@ -546,7 +560,8 @@ fn run(cli: Cli) -> Result<i32> {
                 }
                 match asm.health {
                     Health::Healthy => {
-                        println!("  ✓ healthy · {} blocks OK{}", commas(asm.blocks_total), headroom_text(&asm, " · "))
+                        let label = if asm.stored_bytes_only { "stored bytes healthy (locked)" } else { "healthy" };
+                        println!("  ✓ {label} · {} blocks OK{}", commas(asm.blocks_total), headroom_text(&asm, " · "))
                     }
                     Health::Repairable => {
                         if asm.blocks_damaged > 0 {
@@ -562,7 +577,11 @@ fn run(cli: Cli) -> Result<i32> {
                     Health::Damaged => {
                         let lost =
                             asm.block_states.iter().filter(|s| **s == rqz_core::archive::BlockState::Lost).count();
-                        println!("  ✗ {} blocks damaged, {} beyond repair", commas(asm.blocks_damaged), commas(lost));
+                        println!(
+                            "  ✗ damaged · {} blocks affected, {} beyond repair",
+                            commas(asm.blocks_damaged),
+                            commas(lost)
+                        );
                         println!(
                             "  Next: rqz repair {} --with <another copy>, or rqz x to extract what is intact",
                             archive.display()
@@ -589,49 +608,40 @@ fn run(cli: Cli) -> Result<i32> {
             let opts = fsops::RepairOptions { out: output, in_place, donor: with, password: pw, target };
             let r = fsops::repair_file(&archive, &opts, &ui)?;
             ui.done();
-            let lost = r.plan.lost_files.len()
-                + if r.plan.lost_files.is_empty() { r.plan.lost_blocks.len().min(1) } else { 0 };
             if json {
                 println!(
                     "{}",
-                    json!({"before": format!("{:?}", r.before).to_lowercase(), "after": format!("{:?}", r.after).to_lowercase(), "blocks_fixed": r.plan.blocks_fixed, "recovery_regenerated": r.plan.recovery_regenerated, "structural_fixed": r.plan.structural_fixed, "lost_blocks": r.plan.lost_blocks.len(), "lost_files": r.plan.lost_files, "written": r.written})
+                    json!({"before": format!("{:?}", r.before).to_lowercase(), "after": format!("{:?}", r.after).to_lowercase(),
+                        "blocks_fixed": r.plan.blocks_fixed, "recovery_regenerated": r.plan.recovery_regenerated,
+                        "structural_fixed": r.plan.structural_fixed, "lost_blocks": r.plan.lost_blocks.len(),
+                        "lost_files": r.plan.lost_files, "written": r.written, "outputs": r.outputs,
+                        "verified": r.verified, "stored_bytes_only": r.stored_bytes_only, "notes": r.plan.notes})
                 );
-            } else if r.plan.is_empty() && lost == 0 {
-                println!("  ✓ nothing to repair");
             } else {
-                if let (Some(w), true) = (&r.written, r.split) {
+                for out in &r.outputs {
+                    println!("  → wrote {}", out.display());
+                }
+                if r.exit_code() == 0 {
+                    println!("  ✓ nothing to repair");
+                } else if r.exit_code() == 1 {
+                    println!("  ✓ repair verified{}", if r.stored_bytes_only { " (stored bytes only)" } else { "" });
+                } else {
+                    println!("  ✗ repair incomplete · {} unrecovered block(s)", r.plan.lost_blocks.len());
+                }
+                if !r.outputs.is_empty() {
                     println!(
-                        "  → wrote the repaired volume set to {}{}",
-                        w.parent().map(|p| p.display().to_string()).unwrap_or_default(),
-                        if in_place { " (repaired in place)" } else { " (originals untouched)" }
-                    );
-                } else if let Some(w) = &r.written {
-                    println!(
-                        "  → wrote {} (original untouched{})",
-                        w.display(),
-                        if in_place { ": repaired in place" } else { "" }.replace("original untouched: ", "")
+                        "  fixed {} block(s), regenerated {} recovery symbol(s), repaired {} structure item(s)",
+                        r.plan.blocks_fixed, r.plan.recovery_regenerated, r.plan.structural_fixed
                     );
                 }
-                println!(
-                    "  fixed {} block(s), regenerated {} recovery symbol(s), repaired {} structure item(s)",
-                    r.plan.blocks_fixed, r.plan.recovery_regenerated, r.plan.structural_fixed
-                );
-                if !r.plan.lost_blocks.is_empty() {
-                    println!("  ✗ {} block(s) could not be recovered. Lost files:", r.plan.lost_blocks.len());
-                    for l in &r.plan.lost_files {
-                        println!("    - {l}");
-                    }
-                } else {
-                    println!("  Run `rqz add-protection` to top up redundancy if headroom is low.");
+                for name in &r.plan.lost_files {
+                    println!("  lost: {name}");
+                }
+                for note in &r.plan.notes {
+                    println!("  • {note}");
                 }
             }
-            Ok(if lost > 0 {
-                2
-            } else if r.plan.is_empty() {
-                0
-            } else {
-                1
-            })
+            Ok(r.exit_code())
         }
         Cmd::Info { archive } => {
             let pw = password_for_read(&archive, false)?;
@@ -667,10 +677,9 @@ fn run(cli: Cli) -> Result<i32> {
                     );
                 }
                 println!(
-                    "  + {} recovery ({:.1}% · survives about {} of damage)",
+                    "  + {} recovery ({:.1}% of stored bytes)",
                     human(i.recovery_bytes),
-                    100.0 * i.protection_ratio,
-                    human(i.recovery_bytes)
+                    100.0 * i.protection_ratio
                 );
                 println!(
                     "  {} blocks of {} KiB · {} ECC set(s) · {} groups · {} B symbols",
@@ -734,8 +743,19 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Manifest { archive, snapshot } => {
             let pw = password_for_read(&archive, true)?;
             let a = Archive::open(Source::open(&archive)?, pw.as_deref())?;
+            if !a.has_complete_inventory() {
+                bail!("cannot generate a complete manifest from an incomplete inventory");
+            }
             let mut out = std::io::stdout().lock();
-            a.manifest(snapshot, &mut out)?;
+            if json {
+                a.visit_manifest(snapshot, |path, hash| {
+                    use std::io::Write;
+                    writeln!(out, "{}", json!({"event": "file", "path": path, "sha256": hash}))?;
+                    Ok(())
+                })?;
+            } else {
+                a.manifest(snapshot, &mut out)?;
+            }
             Ok(0)
         }
         Cmd::Mount { archive, mountpoint, snapshot } => {
@@ -761,7 +781,11 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Dev { cmd: DevCmd::Damage { archive, output, spans, len, seed } } => {
             let hits = fsops::damage_copy(&archive, &output, spans, len, seed)?;
-            println!("  corrupted {} span(s) in {}", hits.len(), output.display());
+            if json {
+                println!("{}", json!({"output": output, "damaged_spans": hits}));
+            } else {
+                println!("  corrupted {} span(s) in {}", hits.len(), output.display());
+            }
             Ok(0)
         }
     }
@@ -769,7 +793,9 @@ fn run(cli: Cli) -> Result<i32> {
 
 fn headroom_text(a: &rqz_core::archive::Assessment, sep: &str) -> String {
     match a.min_headroom_ratio {
-        Some(r) => format!("{sep}{:.1}% headroom left", r * 100.0),
+        Some(r) => {
+            format!("{sep}{:.1}% headroom · minimum {} spare symbol(s)", r * 100.0, a.min_headroom_symbols.unwrap_or(0))
+        }
         None => format!("{sep}no recovery data"),
     }
 }
@@ -778,30 +804,32 @@ fn report_pack(json: bool, out: &Path, s: &rqz_core::writer::Summary, verified: 
     if json {
         println!(
             "{}",
-            json!({"archive": out, "files": s.files, "raw_bytes": s.raw_bytes, "stored_bytes": s.stored_bytes, "recovery_bytes": s.recovery_bytes, "file_len": s.file_len, "groups": s.groups, "verified": verified, "volumes": s.volumes, "survive_volumes": survive, "warnings": s.warnings})
+            json!({"archive": out, "files": s.files, "raw_bytes": s.raw_bytes, "stored_bytes": s.stored_bytes, "recovery_bytes": s.recovery_bytes, "file_len": s.file_len, "groups": s.groups, "verified": verified, "volumes": s.volumes, "requested_survive_volumes": survive, "warnings": s.warnings})
         );
         return;
     }
     println!("  {}", out.display());
     println!("  {} files · {} → {}", commas(s.files as usize), human(s.raw_bytes), human(s.stored_bytes));
     if s.recovery_bytes > 0 {
-        println!("  + {} recovery (survives about {} of damage)", human(s.recovery_bytes), human(s.recovery_bytes));
+        println!("  + {} recovery data", human(s.recovery_bytes));
     } else {
         println!("  no recovery data (damage can be detected but not repaired)");
     }
     if s.volumes > 1 {
         println!(
-            "  split into {} volumes ({}.001 …); survives the loss of any {} volume(s)",
+            "  split into {} volumes ({}.001 …)",
             s.volumes,
             out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-            survive
         );
+        if survive > 0 {
+            println!("  recovery sizing target: {survive} missing volume(s); actual recovery depends on which volumes survive");
+        }
     }
     for w in &s.warnings {
         println!("  ⚠ {w}");
     }
-    if s.tiny_profile {
-        println!("  ⚠ small archive: protects against a bad sector, not a dead drive. Keep a second copy elsewhere.");
+    if s.tiny_profile && s.recovery_bytes > 0 {
+        println!("  ⚠ small archive: keep a second copy elsewhere.");
     }
     if verified {
         println!("  ✓ verified after write ({} blocks, 0 errors)", commas(s.blocks as usize));

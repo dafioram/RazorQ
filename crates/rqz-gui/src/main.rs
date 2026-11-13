@@ -28,7 +28,7 @@ struct Opened {
 enum Msg {
     Progress(Event),
     Opened(Result<Box<Opened>, String>),
-    Finished { text: String, ok: bool, open: Option<PathBuf> },
+    Finished { text: String, ok: bool, open: Option<(PathBuf, Option<String>)> },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -87,7 +87,7 @@ impl App {
             inputs: vec![],
             input_bytes: 0,
             protect_pct: 10.0,
-            compression: 1,
+            compression: 2,
             encrypt: false,
             password: String::new(),
             unlock: None,
@@ -149,21 +149,25 @@ impl App {
                     match r {
                         Ok(o) => {
                             self.snapshot = None;
-                            if o.archive.locked {
-                                self.unlock = Some(String::new());
-                            }
+                            self.unlock = o.archive.locked.then(String::new);
                             self.opened = Some(*o);
                             self.tab = Tab::Files;
                         }
-                        Err(e) => self.banner = Some((e, false)),
+                        Err(e) => {
+                            self.banner = Some((e, false));
+                            if self.opened.as_ref().is_some_and(|o| o.archive.locked) {
+                                self.unlock = Some(String::new());
+                            }
+                        }
                     }
                 }
                 Msg::Finished { text, ok, open } => {
                     self.busy = None;
                     self.banner = Some((text, ok));
-                    if let Some(p) = open {
-                        let pw = self.opened.as_ref().and_then(|o| o.password.clone());
+                    if let Some((p, pw)) = open {
+                        let banner = self.banner.take();
                         self.open(ctx, p, pw);
+                        self.banner = banner;
                     }
                 }
             }
@@ -171,10 +175,7 @@ impl App {
     }
 
     fn pick_open(&mut self, ctx: &egui::Context) {
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("razerq archive (any volume)", &["rqz", "rqzp", "001", "002", "003"])
-            .pick_file()
-        {
+        if let Some(p) = rfd::FileDialog::new().set_title("Open an archive, sidecar, or volume").pick_file() {
             self.open(ctx, p, None);
         }
     }
@@ -192,13 +193,14 @@ impl App {
     fn header_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let Some(o) = &self.opened else { return };
         let (color, title) = match o.assessment.health {
+            Health::Healthy if o.assessment.stored_bytes_only => (GREEN, "Stored bytes healthy (locked)"),
             Health::Healthy => (GREEN, "Healthy"),
             Health::Repairable => (AMBER, "Repairable"),
             Health::Damaged => (RED, "Damaged beyond recovery"),
         };
         let lost = o.assessment.block_states.iter().filter(|s| **s == BlockState::Lost).count();
         let low = o.assessment.min_headroom_ratio.map(|r| r < 0.02).unwrap_or(false);
-        let (color, title) = if o.assessment.health == Health::Healthy && low {
+        let (color, title) = if o.assessment.health == Health::Healthy && low && !o.assessment.stored_bytes_only {
             (AMBER, "Healthy, but nearly out of protection")
         } else {
             (color, title)
@@ -209,17 +211,22 @@ impl App {
                 "{} of {} blocks damaged; all recoverable.",
                 o.assessment.blocks_damaged, o.assessment.blocks_total
             ),
-            Health::Damaged => format!("{lost} blocks cannot be recovered. Everything else is intact."),
+            Health::Damaged if !o.assessment.inventory_complete && !o.assessment.stored_bytes_only => {
+                format!("Complete file inventory unavailable. {lost} known block(s) could not be recovered.")
+            }
+            Health::Damaged => format!("{lost} blocks could not be recovered with the available recovery data."),
         };
         let spare = match o.assessment.min_headroom_ratio {
             Some(r) => format!(
-                "Tightest group has {:.1}% spare recovery. Survives about {} of further damage.",
+                "Tightest group: {:.1}% headroom · minimum {} spare symbol(s).",
                 r * 100.0,
-                human(o.info.recovery_bytes)
+                o.assessment.min_headroom_symbols.unwrap_or(0)
             ),
             None => "No recovery data: damage can be detected but not repaired.".into(),
         };
         let path = o.path.clone();
+        let extract_available = !o.info.detached && !o.info.locked;
+        let detached = o.info.detached;
         let health = o.assessment.health;
         let weak = o.info.weak_protection.clone();
         let notes = o.assessment.structural.clone();
@@ -245,17 +252,29 @@ impl App {
                 });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if health != Health::Healthy && ui.button("Save repaired copy…").clicked() {
+                    if health != Health::Healthy && self.busy.is_none() && ui.button("Save repaired copy…").clicked()
+                    {
                         self.start_repair(ctx, &path, None);
                     }
-                    if health == Health::Damaged && ui.button("Repair using another copy…").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().add_filter("razerq archive", &["rqz"]).pick_file() {
+                    if health == Health::Damaged
+                        && self.busy.is_none()
+                        && ui.button("Repair using another copy…").clicked()
+                    {
+                        if let Some(d) = rfd::FileDialog::new().pick_file() {
                             self.start_repair(ctx, &path, Some(d));
                         }
                     }
-                    if ui
-                        .button(if health == Health::Damaged { "Extract what's intact…" } else { "Extract all…" })
-                        .clicked()
+                    if !detached
+                        && ui
+                            .add_enabled(
+                                self.busy.is_none() && extract_available,
+                                egui::Button::new(if health == Health::Damaged {
+                                    "Extract what's intact…"
+                                } else {
+                                    "Extract all…"
+                                }),
+                            )
+                            .clicked()
                     {
                         self.start_extract(ctx);
                     }
@@ -266,28 +285,46 @@ impl App {
     fn start_repair(&mut self, ctx: &egui::Context, path: &Path, donor: Option<PathBuf>) {
         let split = self.opened.as_ref().map(|o| o.archive.source().is_split()).unwrap_or(false);
         // A split archive is repaired into a folder of volumes; a single file into one new file.
+        let detached = self.opened.as_ref().and_then(|o| o.archive.index.detached.as_ref());
         let picked = if split {
             rfd::FileDialog::new().set_title("Choose a folder for the repaired volumes").pick_folder()
         } else {
             rfd::FileDialog::new()
-                .set_file_name(fsops::repaired_name(path).file_name().unwrap().to_string_lossy())
+                .set_file_name(
+                    fsops::repaired_name(detached.map(|d| Path::new(&d.target_name)).unwrap_or(path))
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy(),
+                )
                 .save_file()
         };
         let Some(out) = picked else { return };
         let (path, pw) = (path.to_path_buf(), self.opened.as_ref().and_then(|o| o.password.clone()));
+        let detached_archive = detached.is_some();
         self.spawn(ctx, "Repairing", move |p| {
-            let opts = fsops::RepairOptions { out: Some(out.clone()), donor, password: pw, ..Default::default() };
+            let opts =
+                fsops::RepairOptions { out: Some(out.clone()), donor, password: pw.clone(), ..Default::default() };
             match fsops::repair_file(&path, &opts, p) {
-                Ok(r) if !r.plan.lost_blocks.is_empty() => Msg::Finished {
-                    text: format!("Repaired what was possible; {} file(s) are lost: {}", r.plan.lost_files.len(), r.plan.lost_files.iter().take(5).cloned().collect::<Vec<_>>().join(", ")),
-                    ok: false,
-                    open: r.written,
-                },
-                Ok(r) => Msg::Finished {
-                    text: format!("Repaired: fixed {} block(s), regenerated {} recovery symbol(s). Saved a new file; the original is untouched.", r.plan.blocks_fixed, r.plan.recovery_regenerated),
-                    ok: true,
-                    open: r.written,
-                },
+                Ok(r) => {
+                    let status = match r.exit_code() {
+                        0 => "Nothing to repair.",
+                        1 if r.stored_bytes_only => "Repair verified for stored bytes. Unlock to verify files.",
+                        1 => "Repair verified.",
+                        _ => "Repair incomplete.",
+                    };
+                    let mut details = vec![status.to_owned()];
+                    details.extend(r.outputs.iter().map(|p| format!("Wrote {}", p.display())));
+                    if !r.plan.lost_blocks.is_empty() {
+                        details.push(format!("{} unrecovered block(s).", r.plan.lost_blocks.len()));
+                    }
+                    details.extend(r.plan.lost_files.iter().take(5).map(|f| format!("Lost: {f}")));
+                    details.extend(r.plan.notes.iter().cloned());
+                    Msg::Finished {
+                        text: details.join(" "),
+                        ok: r.exit_code() < 2,
+                        open: if detached_archive { None } else { r.archive_output.map(|p| (p, pw)) },
+                    }
+                }
                 Err(e) => Msg::Finished { text: e.to_string(), ok: false, open: None },
             }
         });
@@ -306,7 +343,17 @@ impl App {
                 if !r.lost.is_empty() {
                     t += &format!(" Lost to damage: {}.", r.lost.join(", "));
                 }
-                Msg::Finished { text: t, ok: r.lost.is_empty(), open: None }
+                if !r.skipped.is_empty() {
+                    t += &format!(" Skipped: {}.", r.skipped.join(", "));
+                }
+                if !r.inventory_complete {
+                    t += " Complete file inventory unavailable.";
+                }
+                Msg::Finished {
+                    text: t,
+                    ok: r.lost.is_empty() && r.skipped.is_empty() && r.inventory_complete,
+                    open: None,
+                }
             }
             Err(e) => Msg::Finished { text: e.to_string(), ok: false, open: None },
         });
@@ -365,16 +412,15 @@ impl App {
         );
         let n = a.block_states.len();
         if n > 0 {
-            let cells = n.min(2400);
-            let per = n.div_ceil(cells);
+            let per = n.div_ceil(2400);
+            let cells = n.div_ceil(per);
             let width = ui.available_width();
             let cell = 11.0f32;
             let cols = ((width / (cell + 2.0)) as usize).max(1);
             let rows = cells.div_ceil(cols);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(width, rows as f32 * (cell + 2.0)), egui::Sense::hover());
             let painter = ui.painter_at(rect);
-            for c in 0..cells {
-                let slice = &a.block_states[c * per..((c + 1) * per).min(n)];
+            for (c, slice) in a.block_states.chunks(per).enumerate() {
                 let color = if slice.contains(&BlockState::Lost) {
                     RED
                 } else if slice.contains(&BlockState::Repairable) {
@@ -414,12 +460,11 @@ impl App {
                 };
                 ui.horizontal(|ui| {
                     ui.label(format!("set {} · group {}", g.set, g.group));
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .fill(color)
-                            .desired_width(220.0)
-                            .text(format!("{} spare · {} erased", g.repair_ok, g.erased)),
-                    );
+                    ui.add(egui::ProgressBar::new(frac).fill(color).desired_width(220.0).text(format!(
+                        "{} spare · {} erased",
+                        g.headroom(),
+                        g.erased
+                    )));
                 });
             }
             if groups.is_empty() {
@@ -457,14 +502,13 @@ impl App {
             ui.label("Protection");
             ui.add(egui::Slider::new(&mut self.protect_pct, 0.0..=30.0).suffix("%"));
         });
-        let rec = (self.input_bytes as f64 * self.protect_pct as f64 / 100.0) as u64;
         let tiny = self.input_bytes < (1 << 20);
         ui.label(RichText::new(if self.protect_pct == 0.0 {
             "No recovery data: damage can be detected but not repaired.".to_string()
         } else if tiny {
             "Small archive: it gets a minimum safety margin, which protects against a bad sector but not a dead drive. Keep a second copy elsewhere.".to_string()
         } else {
-            format!("Adds about {} of recovery data. Survives about {} of damage.", human(rec), human(rec))
+            format!("Targets {:.0}% recovery data relative to stored bytes.", self.protect_pct)
         }).color(MUTED));
         egui::ComboBox::from_label("Compression")
             .selected_text(["None (store)", "Fast (lz4)", "Normal (zstd 6)", "Max (zstd 19)"][self.compression])
@@ -478,7 +522,7 @@ impl App {
             ui.add(egui::TextEdit::singleline(&mut self.password).password(true).hint_text("password"));
         }
         ui.add_space(8.0);
-        let ready = !self.inputs.is_empty() && (!self.encrypt || !self.password.is_empty());
+        let ready = self.busy.is_none() && !self.inputs.is_empty() && (!self.encrypt || !self.password.is_empty());
         if ui.add_enabled(ready, egui::Button::new("Create archive…")).clicked() {
             if let Some(out) = rfd::FileDialog::new().set_file_name("archive.rqz").save_file() {
                 let inputs = self.inputs.clone();
@@ -491,6 +535,7 @@ impl App {
                     Protect { ratio: self.protect_pct as f64 / 100.0, min_repair: 4 }
                 };
                 opts.password = self.encrypt.then(|| self.password.clone());
+                let password = opts.password.clone();
                 self.spawn(ctx, "Packing", move |p| match fsops::pack_paths(&inputs, &out, opts, true, p) {
                     Ok(r) => Msg::Finished {
                         text: format!(
@@ -500,7 +545,7 @@ impl App {
                             r.summary.blocks
                         ),
                         ok: true,
-                        open: Some(out.clone()),
+                        open: Some((out.clone(), password)),
                     },
                     Err(e) => Msg::Finished { text: e.to_string(), ok: false, open: None },
                 });
@@ -590,7 +635,7 @@ impl eframe::App for App {
                     ui.label("Health checks and repair work without the password. Enter it to browse and extract.");
                     ui.add(egui::TextEdit::singleline(pw).password(true).hint_text("password"));
                     ui.horizontal(|ui| {
-                        if ui.button("Unlock").clicked() {
+                        if ui.add_enabled(self.busy.is_none(), egui::Button::new("Unlock")).clicked() {
                             action = Some(true);
                         }
                         if ui.button("Not now").clicked() {

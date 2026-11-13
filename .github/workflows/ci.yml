@@ -56,7 +56,7 @@ jobs:
           expect() { want=$1; shift; set +e; "$@"; got=$?; set -e; test "$got" = "$want" || { echo "expected exit $want, got $got: $*"; exit 1; }; }
           RQZ="$(pwd)/target/release/rqz"
           cd /tmp/smoke
-          expect 0 "$RQZ" pack data -o split.rqz --volume-size 1M --protect low
+          expect 0 "$RQZ" pack data -o split.rqz --volume-size 1M --survive-volumes 1 --protect low
           rm split.rqz.002
           expect 1 "$RQZ" check split.rqz.001
           expect 1 "$RQZ" x split.rqz.001 -o out-split
