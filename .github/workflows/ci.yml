@@ -36,31 +36,33 @@ jobs:
         shell: bash
         run: |
           set -e
+          # rqz exit codes: 0 healthy, 1 repaired or repairable, 2 unrecoverable. Assert the one we expect.
+          expect() { want=$1; shift; set +e; "$@"; got=$?; set -e; test "$got" = "$want" || { echo "expected exit $want, got $got: $*"; exit 1; }; }
           RQZ="$(pwd)/target/release/rqz"
           mkdir -p /tmp/smoke/data && cd /tmp/smoke
           head -c 3000000 /dev/urandom > data/blob.bin
           seq 1 200000 > data/numbers.txt
-          "$RQZ" pack data -o t.rqz
-          "$RQZ" check t.rqz
-          "$RQZ" dev damage t.rqz -o bad.rqz --spans 6 --len 8192
-          set +e; "$RQZ" check bad.rqz; code=$?; set -e
-          test "$code" = 1
-          "$RQZ" x bad.rqz -o out
+          expect 0 "$RQZ" pack data -o t.rqz
+          expect 0 "$RQZ" check t.rqz
+          expect 0 "$RQZ" dev damage t.rqz -o bad.rqz --spans 6 --len 8192
+          expect 1 "$RQZ" check bad.rqz
+          expect 1 "$RQZ" x bad.rqz -o out      # heals in memory, so exit 1
           diff -r data out/data
       - name: Smoke test (split volumes)
         shell: bash
         run: |
           set -e
+          # rqz exit codes: 0 healthy, 1 repaired or repairable, 2 unrecoverable. Assert the one we expect.
+          expect() { want=$1; shift; set +e; "$@"; got=$?; set -e; test "$got" = "$want" || { echo "expected exit $want, got $got: $*"; exit 1; }; }
           RQZ="$(pwd)/target/release/rqz"
           cd /tmp/smoke
-          "$RQZ" pack data -o split.rqz --volume-size 1M --protect low
+          expect 0 "$RQZ" pack data -o split.rqz --volume-size 1M --protect low
           rm split.rqz.002
-          set +e; "$RQZ" check split.rqz.001; code=$?; set -e
-          test "$code" = 1
-          "$RQZ" x split.rqz.001 -o out-split
+          expect 1 "$RQZ" check split.rqz.001
+          expect 1 "$RQZ" x split.rqz.001 -o out-split
           diff -r data out-split/data
-          "$RQZ" repair split.rqz.001 -o fixed
-          "$RQZ" check fixed/split.rqz.001
+          expect 1 "$RQZ" repair split.rqz.001 -o fixed
+          expect 0 "$RQZ" check fixed/split.rqz.001
       - name: Smoke test (serve over WebDAV)
         shell: bash
         run: |
