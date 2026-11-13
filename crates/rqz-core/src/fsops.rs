@@ -8,10 +8,17 @@ use crate::progress::{Event, Progress};
 use crate::storage::ReadAt;
 use crate::volume::{volume_file_name, VolumeSet, VolumeWriter, VOL_MAGIC};
 use crate::writer::*;
+use cap_fs_ext::DirExt;
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions as DirOpenOptions},
+};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tempfile::{NamedTempFile, TempDir};
 
 // ---------------------------------------------------------------- sources (file or volume set)
 
@@ -179,7 +186,7 @@ fn rel_name(p: &Path) -> Option<String> {
     let mut parts = Vec::new();
     for c in p.components() {
         match c {
-            Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
+            Component::Normal(s) => parts.push(s.to_str()?.to_owned()),
             Component::CurDir => {}
             _ => return None,
         }
@@ -190,6 +197,7 @@ fn rel_name(p: &Path) -> Option<String> {
 pub fn collect(inputs: &[PathBuf], exclude: Option<&Path>) -> Result<(Vec<Entry>, u64)> {
     let mut out = Vec::new();
     let mut total = 0u64;
+    let mut names = HashSet::new();
     let excl = exclude.and_then(|e| fs::canonicalize(e).ok());
     for input in inputs {
         let base = input.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -199,9 +207,8 @@ pub fn collect(inputs: &[PathBuf], exclude: Option<&Path>) -> Result<(Vec<Entry>
                 .follow_links(false)
                 .sort_by_file_name()
                 .into_iter()
-                .filter_map(|e| e.ok())
-                .map(|e| e.into_path())
-                .collect()
+                .map(|e| e.map(|e| e.into_path()).map_err(std::io::Error::from))
+                .collect::<std::io::Result<_>>()?
         } else {
             vec![input.clone()]
         };
@@ -214,7 +221,8 @@ pub fn collect(inputs: &[PathBuf], exclude: Option<&Path>) -> Result<(Vec<Entry>
             let m = fs::symlink_metadata(&p)?;
             let rel = match rel_name(p.strip_prefix(&base).unwrap_or(&p)) {
                 Some(r) => r,
-                None => continue,
+                None if p == *input && m.is_dir() && p.file_name().is_none() => continue,
+                None => return Err(Error::Other(format!("cannot represent input path {}", p.display()))),
             };
             let (kind, link) = if m.file_type().is_symlink() {
                 (KIND_SYMLINK, Some(fs::read_link(&p)?.to_string_lossy().replace('\\', "/")))
@@ -223,8 +231,12 @@ pub fn collect(inputs: &[PathBuf], exclude: Option<&Path>) -> Result<(Vec<Entry>
             } else if m.is_file() {
                 (KIND_FILE, None)
             } else {
-                continue;
+                return Err(Error::Unsupported(format!("cannot archive special file {}", p.display())));
             };
+            validate_member_path(&rel)?;
+            if !names.insert(rel.clone()) {
+                return Err(Error::Other(format!("duplicate archive path {rel:?}")));
+            }
             let size = if kind == KIND_FILE { m.len() } else { 0 };
             total += size;
             out.push(Entry { src: p, rel, kind, size, mode: mode_of(&m), mtime: mtime_of(&m), link });
@@ -233,65 +245,152 @@ pub fn collect(inputs: &[PathBuf], exclude: Option<&Path>) -> Result<(Vec<Entry>
     Ok((out, total))
 }
 
+fn parent_dir(path: &Path) -> &Path {
+    path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
+}
+
+fn lock_path(path: &Path) -> Result<PathBuf> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(Error::Other("update the archive by its actual path instead of a symlink".into()));
+    }
+    let actual = fs::canonicalize(path)?;
+    let mut name = actual.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    Ok(actual.with_file_name(name))
+}
+
+fn lock_archive(path: &Path) -> Result<File> {
+    let path = lock_path(path)?;
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+    file.try_lock().map_err(|e| Error::Other(format!("cannot lock archive for update: {e}")))?;
+    Ok(file)
+}
+
+fn ensure_new(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(Error::Other(format!("output already exists: {}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn stage_file(dest: &Path, source: Option<&Path>) -> Result<NamedTempFile> {
+    let mut file = NamedTempFile::new_in(parent_dir(dest))?;
+    if let Some(source) = source {
+        let mut input = File::open(source)?;
+        std::io::copy(&mut input, file.as_file_mut())?;
+        file.as_file().set_permissions(input.metadata()?.permissions())?;
+        file.as_file_mut().rewind()?;
+    }
+    Ok(file)
+}
+
+fn publish_file(file: NamedTempFile, dest: &Path, replace: bool) -> Result<()> {
+    file.as_file().sync_all()?;
+    let result = if replace { file.persist(dest) } else { file.persist_noclobber(dest) };
+    result.map_err(|e| Error::Io(e.error))?;
+    #[cfg(unix)]
+    File::open(parent_dir(dest))?.sync_all()?;
+    Ok(())
+}
+
+/// Publish verified volumes under new names. If publication stops partway, roll back the names
+/// this operation published; any existing archive or unrelated file remains in place.
+fn publish_volumes(stage: &Path, dest: &Path, base: &str) -> Result<()> {
+    let mut sources = volume_siblings(&stage.join(volume_file_name(base, 0)));
+    if sources.is_empty() {
+        return Err(Error::Other("no staged volumes to publish".into()));
+    }
+    // Publish the conventional entry point last.
+    sources.rotate_left(1);
+    let mut published = Vec::new();
+    for source in sources {
+        let path = dest.join(source.file_name().unwrap());
+        let result = tempfile::TempPath::try_from_path(source)
+            .and_then(|temp| temp.persist_noclobber(&path).map_err(|e| e.error));
+        if let Err(e) = result {
+            for p in published {
+                let _ = fs::remove_file(p);
+            }
+            return Err(e.into());
+        }
+        published.push(path);
+    }
+    #[cfg(unix)]
+    File::open(dest)?.sync_all()?;
+    Ok(())
+}
+
 /// A writer for either a single file or a split-volume set.
 #[allow(clippy::large_enum_variant)]
 pub enum AnyWriter<'p> {
-    File(ArchiveWriter<'p, File>),
-    Vol(ArchiveWriter<'p, VolumeWriter>),
+    File(ArchiveWriter<'p, File>, NamedTempFile),
+    Vol(ArchiveWriter<'p, VolumeWriter>, TempDir),
 }
 
 impl<'p> AnyWriter<'p> {
     pub fn create(out: &Path, mut opts: PackOptions, progress: &'p dyn Progress) -> Result<Self> {
+        ensure_new(out)?;
         if opts.volume_size > 0 {
-            let dir = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
-            let base = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            // One ECC set across the whole archive, so recovery data is striped over every volume.
-            opts.set_bytes = u64::MAX;
-            // Remove leftovers from an earlier run with the same name.
-            for old in volume_siblings(&dir.join(volume_file_name(&base, 0))) {
-                let _ = fs::remove_file(old);
+            let base =
+                out.file_name().and_then(|n| n.to_str()).ok_or_else(|| Error::Other("invalid volume name".into()))?;
+            if !volume_siblings(out).is_empty() {
+                return Err(Error::Other(format!("split output already exists: {}", out.display())));
             }
-            let vw = VolumeWriter::new(&dir, &base, opts.volume_size);
-            Ok(AnyWriter::Vol(ArchiveWriter::create(vw, opts, progress)?))
+            let stage = tempfile::tempdir_in(parent_dir(out))?;
+            // One ECC set across the whole archive.
+            opts.set_bytes = u64::MAX;
+            let vw = VolumeWriter::new(stage.path(), base, opts.volume_size);
+            Ok(AnyWriter::Vol(ArchiveWriter::create(vw, opts, progress)?, stage))
         } else {
-            let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(out)?;
-            Ok(AnyWriter::File(ArchiveWriter::create(f, opts, progress)?))
+            let stage = stage_file(out, None)?;
+            Ok(AnyWriter::File(ArchiveWriter::create(stage.reopen()?, opts, progress)?, stage))
         }
     }
 
     pub fn add_file<R: Read>(&mut self, path: &str, mode: u32, mtime: i64, r: &mut R) -> Result<u64> {
         match self {
-            AnyWriter::File(w) => w.add_file(path, mode, mtime, r),
-            AnyWriter::Vol(w) => w.add_file(path, mode, mtime, r),
+            AnyWriter::File(w, _) => w.add_file(path, mode, mtime, r),
+            AnyWriter::Vol(w, _) => w.add_file(path, mode, mtime, r),
         }
     }
     pub fn add_dir(&mut self, path: &str, mode: u32, mtime: i64) -> Result<()> {
         match self {
-            AnyWriter::File(w) => w.add_dir(path, mode, mtime),
-            AnyWriter::Vol(w) => w.add_dir(path, mode, mtime),
+            AnyWriter::File(w, _) => w.add_dir(path, mode, mtime),
+            AnyWriter::Vol(w, _) => w.add_dir(path, mode, mtime),
         }
     }
     pub fn add_symlink(&mut self, path: &str, target: &str, mode: u32, mtime: i64) -> Result<()> {
         match self {
-            AnyWriter::File(w) => w.add_symlink(path, target, mode, mtime),
-            AnyWriter::Vol(w) => w.add_symlink(path, target, mode, mtime),
+            AnyWriter::File(w, _) => w.add_symlink(path, target, mode, mtime),
+            AnyWriter::Vol(w, _) => w.add_symlink(path, target, mode, mtime),
         }
     }
 
-    /// Finish; returns the summary and the path to open for verification (first volume or the file).
-    pub fn finish(self, out: &Path) -> Result<(Summary, PathBuf)> {
+    fn finish(self, out: &Path, verify: bool, password: Option<&str>, progress: &dyn Progress) -> Result<Summary> {
         match self {
-            AnyWriter::File(w) => {
-                let (f, summary) = w.finish()?;
-                f.sync_all()?;
-                Ok((summary, out.to_path_buf()))
+            AnyWriter::File(w, stage) => {
+                let (file, summary) = w.finish()?;
+                file.sync_all()?;
+                drop(file);
+                if verify {
+                    verify_written(stage.path(), password, progress)?;
+                }
+                publish_file(stage, out, false)?;
+                Ok(summary)
             }
-            AnyWriter::Vol(w) => {
+            AnyWriter::Vol(w, stage) => {
                 let (vw, mut summary) = w.finish()?;
                 let (paths, _) = vw.finalize()?;
                 summary.volumes = paths.len() as u32;
-                summary.file_len = paths.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
-                Ok((summary, paths[0].clone()))
+                summary.file_len =
+                    paths.iter().map(|p| fs::metadata(p).map(|m| m.len())).sum::<std::io::Result<u64>>()?;
+                if verify {
+                    verify_written(&paths[0], password, progress)?;
+                }
+                let base = out.file_name().unwrap().to_str().unwrap();
+                publish_volumes(stage.path(), parent_dir(out), base)?;
+                Ok(summary)
             }
         }
     }
@@ -336,16 +435,17 @@ pub fn pack_paths(
     verify: bool,
     progress: &dyn Progress,
 ) -> Result<PackResult> {
-    let (entries, total) = collect(inputs, Some(out))?;
+    ensure_new(out)?;
+    let (entries, total) = collect(inputs, None)?;
+    if entries.is_empty() {
+        return Err(Error::Other("nothing to pack".into()));
+    }
     opts.total_hint = Some(total);
     let pw = opts.password.clone();
     progress.emit(Event::Stage("Packing".into()));
     let mut w = AnyWriter::create(out, opts, progress)?;
     feed(&mut w, &entries)?;
-    let (summary, first) = w.finish(out)?;
-    if verify {
-        verify_written(&first, pw.as_deref(), progress)?;
-    }
+    let summary = w.finish(out, verify, pw.as_deref(), progress)?;
     Ok(PackResult { summary, verified: verify })
 }
 
@@ -361,11 +461,22 @@ pub fn add_paths(
     if src.is_split() {
         return Err(Error::Unsupported("adding to a split archive is not supported yet".into()));
     }
-    let a = Archive::open(src, pw.as_deref())?;
-    let (entries, total) = collect(inputs, Some(archive))?;
+    let _lock = lock_archive(archive)?;
+    let a = Archive::open(Source::open(archive)?, pw.as_deref())?;
+    let (mut entries, mut total) = collect(inputs, Some(archive))?;
+    let lock_name = lock_path(archive)?;
+    entries.retain(|entry| {
+        if fs::canonicalize(&entry.src).ok().as_ref() == Some(&lock_name) {
+            total -= entry.size;
+            false
+        } else {
+            true
+        }
+    });
     let mut opts = opts;
     opts.total_hint = Some(total);
-    let f = OpenOptions::new().read(true).write(true).open(archive)?;
+    let stage = stage_file(archive, Some(archive))?;
+    let f = stage.reopen()?;
     progress.emit(Event::Stage("Adding".into()));
     let mut w = ArchiveWriter::append(f, &a, opts, progress)?;
     for e in &entries {
@@ -382,8 +493,9 @@ pub fn add_paths(
     f.sync_all()?;
     drop(f);
     if verify {
-        verify_written(archive, pw.as_deref(), progress)?;
+        verify_written(stage.path(), pw.as_deref(), progress)?;
     }
+    publish_file(stage, archive, true)?;
     Ok(PackResult { summary, verified: verify })
 }
 
@@ -397,12 +509,19 @@ pub fn add_protection_file(
     if src.is_split() {
         return Err(Error::Unsupported("add-protection is not supported on split archives yet".into()));
     }
-    let a = Archive::open(src, password)?;
-    let f = OpenOptions::new().read(true).write(true).open(path)?;
-    let mut w = ArchiveWriter::append(f, &a, PackOptions::default(), progress)?;
+    let _lock = lock_archive(path)?;
+    let a = Archive::open(Source::open(path)?, password)?;
+    if extra.ratio == 0.0 {
+        return Ok(0);
+    }
+    let stage = stage_file(path, Some(path))?;
+    let mut w = ArchiveWriter::maintain(stage.reopen()?, &a, progress)?;
     let added = w.add_protection(extra)?;
     let (f, _) = w.finish()?;
     f.sync_all()?;
+    drop(f);
+    verify_written(stage.path(), password, progress)?;
+    publish_file(stage, path, true)?;
     Ok(added)
 }
 
@@ -421,21 +540,28 @@ pub fn protect_file(
     verify: bool,
     progress: &dyn Progress,
 ) -> Result<Summary> {
-    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Other("invalid protected file name".into()))?;
+    validate_member_path(name)?;
     let t = File::open(target)?;
-    let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(out)?;
+    ensure_new(out)?;
+    let stage = stage_file(out, None)?;
+    let f = stage.reopen()?;
     progress.emit(Event::Stage("Protecting".into()));
-    let w = ArchiveWriter::create_detached(f, opts, t, &name, progress)?;
+    let w = ArchiveWriter::create_detached(f, opts, t, name, progress)?;
     let (f, summary) = w.finish()?;
     f.sync_all()?;
     drop(f);
     if verify {
-        let mut a = Archive::open(Source::open(out)?, None)?;
+        let mut a = Archive::open(Source::open(stage.path())?, None)?;
         a.attach_target(Box::new(File::open(target)?));
         if !a.assess(progress).is_healthy() {
             return Err(Error::Other("sidecar verification failed".into()));
         }
     }
+    publish_file(stage, out, false)?;
     Ok(summary)
 }
 
@@ -448,9 +574,15 @@ pub fn open_any(
     let mut a = Archive::open(Source::open(path)?, password)?;
     let mut tpath = None;
     if let Some(d) = a.index.detached.clone() {
-        let t = target
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).join(&d.target_name));
+        let t = if let Some(p) = target {
+            p.to_path_buf()
+        } else {
+            validate_member_path(&d.target_name)?;
+            if d.target_name.contains('/') {
+                return Err(Error::Corrupt("sidecar target name must be a single component".into()));
+            }
+            parent_dir(path).join(&d.target_name)
+        };
         a.attach_target(Box::new(
             File::open(&t).map_err(|e| Error::Other(format!("cannot open protected file {}: {e}", t.display())))?,
         ));
@@ -477,6 +609,10 @@ pub struct RepairReport {
     pub written: Option<PathBuf>,
     /// The archive is a split-volume set; `written` is then its first volume.
     pub split: bool,
+    pub archive_output: Option<PathBuf>,
+    pub stored_bytes_only: bool,
+    pub outputs: Vec<PathBuf>,
+    pub verified: bool,
 }
 
 pub fn repaired_name(p: &Path) -> PathBuf {
@@ -494,26 +630,17 @@ pub fn apply_patches_file(f: &mut File, patches: &[Patch]) -> Result<()> {
     Ok(())
 }
 
-/// Write a repaired copy of a split archive. Returns the first volume of the result.
-fn repair_volumes(set: &VolumeSet, src: &Source, patches: &[Patch], o: &RepairOptions) -> Result<PathBuf> {
-    let rewrites = set.plan_volume_patches(patches);
-    let outdir =
-        if o.in_place { src.dir().to_path_buf() } else { o.out.clone().unwrap_or_else(|| src.dir().join("repaired")) };
-    fs::create_dir_all(&outdir)?;
-    let base = src.base_name().to_string();
-    if !o.in_place {
-        for (i, p) in src.volume_paths().iter().enumerate() {
-            if let Some(p) = p {
-                fs::copy(p, outdir.join(volume_file_name(&base, i as u32)))?;
-            }
+/// Build a complete split set in a private directory before publishing it.
+fn stage_repair_volumes(set: &VolumeSet, src: &Source, patches: &[Patch], stage: &Path) -> Result<PathBuf> {
+    let base = src.base_name();
+    for (i, p) in src.volume_paths().iter().enumerate() {
+        if let Some(p) = p {
+            fs::copy(p, stage.join(volume_file_name(base, i as u32)))?;
         }
     }
-    for rw in rewrites {
-        let path = outdir.join(volume_file_name(&base, rw.index));
-        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
-        if rw.create {
-            f.set_len(set.vh_len + rw.payload_len)?;
-        }
+    for rw in set.plan_volume_patches(patches) {
+        let path = stage.join(volume_file_name(base, rw.index));
+        let mut f = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         if let Some(h) = &rw.header {
             f.seek(SeekFrom::Start(0))?;
             f.write_all(h)?;
@@ -522,97 +649,247 @@ fn repair_volumes(set: &VolumeSet, src: &Source, patches: &[Patch], o: &RepairOp
             f.seek(SeekFrom::Start(p.offset))?;
             f.write_all(&p.data)?;
         }
-        if f.metadata()?.len() < set.vh_len + rw.payload_len {
-            f.set_len(set.vh_len + rw.payload_len)?;
-        }
+        f.set_len(set.vh_len + rw.payload_len)?;
         f.sync_all()?;
     }
-    Ok(outdir.join(volume_file_name(&base, 0)))
+    for path in volume_siblings(&stage.join(volume_file_name(base, 0))) {
+        File::open(path)?.sync_all()?;
+    }
+    Ok(stage.join(volume_file_name(base, 0)))
+}
+
+fn sidecar_for_target(
+    source: &Path,
+    target_output: &Path,
+    archive_patches: &[Patch],
+    progress: &dyn Progress,
+) -> Result<(NamedTempFile, PathBuf)> {
+    let output = sidecar_path(target_output);
+    ensure_new(&output)?;
+    let mut stage = stage_file(&output, Some(source))?;
+    apply_patches_file(stage.as_file_mut(), archive_patches)?;
+    let sidecar = Archive::open(Source::open(stage.path())?, None)?;
+    let name = target_output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Other("invalid repaired target name".into()))?;
+    let writer = ArchiveWriter::rebind_sidecar(stage.reopen()?, &sidecar, name, progress)?;
+    let (file, _) = writer.finish()?;
+    file.sync_all()?;
+    Ok((stage, output))
+}
+
+fn repair_assessment(
+    archive: &Path,
+    target: Option<&Path>,
+    password: Option<&str>,
+    progress: &dyn Progress,
+) -> Result<Health> {
+    let (a, _) = open_any(archive, password, target)?;
+    Ok(a.assess(progress).health)
+}
+
+impl RepairReport {
+    pub fn exit_code(&self) -> i32 {
+        if self.after != Health::Healthy || !self.plan.lost_blocks.is_empty() {
+            2
+        } else if self.outputs.is_empty() {
+            0
+        } else {
+            1
+        }
+    }
 }
 
 pub fn repair_file(path: &Path, o: &RepairOptions, progress: &dyn Progress) -> Result<RepairReport> {
-    let (a, tpath) = open_any(path, o.password.as_deref(), o.target.as_deref())?;
-    let asm = a.assess(progress);
-    let donor = match &o.donor {
-        Some(d) => Some(Archive::open(Source::open(d)?, o.password.as_deref())?),
-        None => None,
+    if o.in_place && o.out.is_some() {
+        return Err(Error::Other("choose either an output or in-place repair".into()));
+    }
+    let password = o.password.as_deref();
+    let _lock = if o.in_place {
+        let source = Source::open(path)?;
+        if source.is_split() {
+            return Err(Error::Unsupported("choose a new output folder to repair a split archive".into()));
+        }
+        Some(lock_archive(path)?)
+    } else {
+        None
     };
-    let plan = a.plan_repair(&asm, donor.as_ref().map(|d| d as &dyn Donor), progress);
+    let (a, target) = open_any(path, password, o.target.as_deref())?;
+    if o.in_place && a.header.detached() {
+        return Err(Error::Unsupported("choose a new output to repair a detached sidecar".into()));
+    }
+    let before = a.assess(progress);
+    let donor = o.donor.as_ref().map(|p| Archive::open(Source::open(p)?, None)).transpose()?;
+    let mut plan = a.plan_repair(&before, donor.as_ref().map(|d| d as &dyn Donor), progress);
     let split = a.source().is_split();
     let incomplete = a.source().is_incomplete();
-    if plan.is_empty() && !incomplete {
-        return Ok(RepairReport { before: asm.health, after: asm.health, plan, written: None, split });
-    }
-    let mut written = None;
-    if split {
-        let set = a.source().volume_set().expect("split source has a volume set");
-        written = Some(repair_volumes(set, a.source(), &plan.patches, o)?);
-    } else if !plan.patches.is_empty() {
-        let dest = if o.in_place { path.to_path_buf() } else { o.out.clone().unwrap_or_else(|| repaired_name(path)) };
-        if !o.in_place {
-            fs::copy(path, &dest)?;
-        }
-        let mut f = OpenOptions::new().read(true).write(true).open(&dest)?;
-        apply_patches_file(&mut f, &plan.patches)?;
-        written = Some(dest);
-    }
-    if !plan.target_patches.is_empty() {
-        let t = tpath.clone().ok_or_else(|| Error::Other("no protected file to repair".into()))?;
-        let dest = if o.in_place { t.clone() } else { repaired_name(&t) };
-        if !o.in_place {
-            fs::copy(&t, &dest)?;
-        }
-        let mut f = OpenOptions::new().read(true).write(true).open(&dest)?;
-        apply_patches_file(&mut f, &plan.target_patches)?;
-        written = Some(dest);
-    }
-    let after = match &written {
-        Some(w) if tpath.is_none() => Archive::open(Source::open(w)?, o.password.as_deref())
-            .map(|r| r.assess(progress).health)
-            .unwrap_or(Health::Damaged),
-        Some(w) => {
-            let mut r = Archive::open(Source::open(path)?, o.password.as_deref())?;
-            r.attach_target(Box::new(File::open(w)?));
-            r.assess(progress).health
-        }
-        None => asm.health,
+    let mut report = RepairReport {
+        before: before.health,
+        after: before.health,
+        plan: RepairPlan::default(),
+        written: None,
+        split,
+        archive_output: None,
+        stored_bytes_only: before.stored_bytes_only,
+        outputs: Vec::new(),
+        verified: false,
     };
-    Ok(RepairReport { before: asm.health, after, plan, written, split })
+    if let Some(set) = a.source().volume_set() {
+        if (!plan.patches.is_empty() || incomplete) && a.has_valid_index() {
+            let src = a.source();
+            let dest = o.out.clone().unwrap_or_else(|| src.dir().join("repaired"));
+            fs::create_dir_all(&dest)?;
+            if !volume_siblings(&dest.join(volume_file_name(src.base_name(), 0))).is_empty() {
+                return Err(Error::Other(format!("split output already exists in {}", dest.display())));
+            }
+            let stage = tempfile::tempdir_in(&dest)?;
+            let first = stage_repair_volumes(set, src, &plan.patches, stage.path())?;
+            report.after = repair_assessment(&first, None, password, progress)?;
+            report.verified = report.after == Health::Healthy;
+            publish_volumes(stage.path(), &dest, src.base_name())?;
+            report.outputs = volume_siblings(&dest.join(first.file_name().unwrap()));
+            report.written = Some(dest.join(first.file_name().unwrap()));
+            report.archive_output = report.written.clone();
+        }
+    } else if !plan.is_empty() {
+        let target_changes = !plan.target_patches.is_empty() || plan.target_len.is_some();
+        // A repaired detached target gets a matching sidecar beside it.
+        // Verify the staged pair before publishing either file.
+        let mut target_stage = None;
+        if target_changes {
+            let source = target.as_ref().ok_or_else(|| Error::Other("no protected file to repair".into()))?;
+            let output = o.out.clone().unwrap_or_else(|| repaired_name(source));
+            ensure_new(&output)?;
+            let mut file = stage_file(&output, Some(source))?;
+            apply_patches_file(file.as_file_mut(), &plan.target_patches)?;
+            if let Some(len) = plan.target_len {
+                file.as_file().set_len(len)?;
+            }
+            target_stage = Some((file, output));
+        }
+        let archive_stage = if let Some((_, output)) = &target_stage {
+            Some(sidecar_for_target(path, output, &plan.patches, progress)?)
+        } else if !plan.patches.is_empty() {
+            let dest =
+                if o.in_place { path.to_path_buf() } else { o.out.clone().unwrap_or_else(|| repaired_name(path)) };
+            if !o.in_place {
+                ensure_new(&dest)?;
+            }
+            let mut file = stage_file(&dest, Some(path))?;
+            apply_patches_file(file.as_file_mut(), &plan.patches)?;
+            Some((file, dest))
+        } else {
+            None
+        };
+        report.after = repair_assessment(
+            archive_stage.as_ref().map_or(path, |(file, _)| file.path()),
+            target_stage.as_ref().map(|(file, _)| file.path()).or(target.as_deref()),
+            password,
+            progress,
+        )
+        .unwrap_or_else(|e| {
+            plan.notes.push(format!("output verification failed: {e}"));
+            Health::Damaged
+        });
+        report.verified = report.after == Health::Healthy;
+        if o.in_place && !report.verified {
+            return Err(Error::Other("repair did not verify; originals were preserved".into()));
+        }
+        if let Some((file, output)) = target_stage {
+            publish_file(file, &output, false)?;
+            report.outputs.push(output);
+        }
+        if let Some((file, dest)) = archive_stage {
+            if let Err(e) = publish_file(file, &dest, o.in_place) {
+                if !o.in_place {
+                    for published in &report.outputs {
+                        let _ = fs::remove_file(published);
+                    }
+                }
+                return Err(e);
+            }
+            report.archive_output = Some(dest.clone());
+            report.outputs.push(dest);
+        }
+        report.written = report.outputs.first().cloned();
+    }
+    if report.after != Health::Healthy && plan.notes.is_empty() {
+        plan.notes.push("damage remains; extract what is available or try a second copy".into());
+    }
+    report.plan = plan;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------- extract
 
-fn safe_join(dest: &Path, rel: &str) -> Option<PathBuf> {
-    let mut p = dest.to_path_buf();
-    for c in rel.split('/') {
-        if c.is_empty()
-            || c == "."
-            || c == ".."
-            || c.contains('\\')
-            || c.contains('\0')
-            || (cfg!(windows) && c.contains(':'))
-        {
-            return None;
+fn open_child_dir(parent: &Dir, name: &str) -> std::io::Result<Dir> {
+    match parent.open_dir_nofollow(name) {
+        Ok(dir) => Ok(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            parent.open_dir_nofollow(name)
         }
-        p.push(c);
+        Err(e) => Err(e),
     }
-    Some(p)
 }
 
-/// Refuse to write through a symlink that already exists inside the destination.
-fn ancestors_are_plain(dest: &Path, full: &Path) -> bool {
-    let Ok(rest) = full.strip_prefix(dest) else { return false };
-    let mut cur = dest.to_path_buf();
-    let comps: Vec<_> = rest.components().collect();
-    for c in comps.iter().take(comps.len().saturating_sub(1)) {
-        cur.push(c);
-        if let Ok(m) = fs::symlink_metadata(&cur) {
-            if m.file_type().is_symlink() {
-                return false;
-            }
-        }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn publish_restored(dir: &Dir, temp: &str, name: &str) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags};
+    use rustix::io::Errno;
+    match renameat_with(dir, temp, dir, name, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => dir.hard_link(temp, dir, name),
+        Err(e) => Err(e.into()),
     }
-    true
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn publish_restored(dir: &Dir, temp: &str, name: &str) -> std::io::Result<()> {
+    // On Windows use MoveFile via std/cap-std only for replacement. A hard link is the
+    // no-clobber publication operation on filesystems that support it.
+    dir.hard_link(temp, dir, name)
+}
+
+fn restore_file<S: ReadAt>(
+    archive: &Archive<S>,
+    entry: &FileEntry,
+    dir: &Dir,
+    name: &str,
+    cache: &mut BlockCache,
+) -> Result<()> {
+    let rand = crate::crypto::random_bytes::<16>();
+    let temp = format!(".rqz-restore-{:032x}", u128::from_le_bytes(rand));
+    let file = dir.open_with(&temp, DirOpenOptions::new().write(true).create_new(true))?.into_std();
+    let result = (|| -> Result<()> {
+        let mut out = std::io::BufWriter::new(file);
+        archive.extract_to(entry, &mut out, cache)?;
+        let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+        let _ = file.set_modified(UNIX_EPOCH + Duration::from_secs(entry.mtime.max(0) as u64));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
+        }
+        file.sync_all()?;
+        drop(file);
+        // Publish without following or replacing any existing destination entry.
+        publish_restored(dir, &temp, name)?;
+        Ok(())
+    })();
+    let cleanup = dir.remove_file(&temp);
+    result?;
+    match cleanup {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 #[derive(Default, Debug)]
@@ -622,6 +899,7 @@ pub struct ExtractReport {
     pub lost: Vec<String>,
     pub skipped: Vec<String>,
     pub healed_groups: usize,
+    pub inventory_complete: bool,
 }
 
 pub fn extract_archive(
@@ -634,72 +912,91 @@ pub fn extract_archive(
     if a.locked {
         return Err(Error::PasswordRequired);
     }
+    if a.header.detached() {
+        return Err(Error::Unsupported("use repair with the protected file to restore a detached sidecar".into()));
+    }
     fs::create_dir_all(dest)?;
-    let mut rep = ExtractReport::default();
+    let root = Dir::open_ambient_dir(dest, ambient_authority())?;
+    let healed_before = a.healed_groups();
+    let mut rep = ExtractReport { inventory_complete: a.has_complete_inventory(), ..Default::default() };
     let mut cache = BlockCache::default();
     let wanted = |p: &str| {
         filter.is_empty() || filter.iter().any(|f| p == f || p.starts_with(&format!("{}/", f.trim_end_matches('/'))))
     };
-    let entries: Vec<&FileEntry> = a.visible_files(snapshot).into_iter().filter(|f| wanted(&f.path)).collect();
+    if let Some(id) = snapshot {
+        if !a.index.snapshots.iter().any(|snapshot| snapshot.id == id) {
+            return Err(Error::Other(format!("unknown snapshot {id}")));
+        }
+    }
+    let visible = a.visible_files(snapshot);
+    for selection in filter {
+        let prefix = format!("{}/", selection.trim_end_matches('/'));
+        if !visible.iter().any(|f| f.path == *selection || f.path.starts_with(&prefix)) {
+            rep.skipped.push(format!("{selection} (not in the file inventory)"));
+        }
+    }
+    let entries: Vec<&FileEntry> = visible.into_iter().filter(|f| wanted(&f.path)).collect();
     let total: u64 = entries.iter().map(|f| f.size).sum();
     progress.emit(Event::Stage("Extracting".into()));
     let mut done = 0u64;
     for f in entries {
-        let Some(full) = safe_join(dest, &f.path) else {
-            rep.skipped.push(format!("{} (unsafe path)", f.path));
-            continue;
-        };
-        if !ancestors_are_plain(dest, &full) {
-            rep.skipped.push(format!("{} (would write through a symlink)", f.path));
-            continue;
-        }
-        match f.kind {
-            KIND_DIR => fs::create_dir_all(&full)?,
-            KIND_SYMLINK => {
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                #[cfg(unix)]
-                {
-                    let _ = fs::remove_file(&full);
-                    std::os::unix::fs::symlink(f.link.clone().unwrap_or_default(), &full)?;
-                }
-                #[cfg(not(unix))]
-                rep.skipped.push(format!("{} (symlinks are not extracted on this platform)", f.path));
+        let result = (|| -> Result<()> {
+            validate_member_path(&f.path)?;
+            let mut components = f.path.split('/');
+            let mut dir = root.try_clone()?;
+            let mut name = components.next().unwrap_or_default();
+            for next in components {
+                dir = open_child_dir(&dir, name)?;
+                name = next;
             }
-            _ => {
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)?;
+            match f.kind {
+                KIND_DIR => {
+                    open_child_dir(&dir, name)?;
                 }
-                let file = File::create(&full)?;
-                let mut bw = std::io::BufWriter::new(file);
-                match a.extract_to(f, &mut bw, &mut cache) {
-                    Ok(()) => {
-                        bw.flush()?;
-                        let file = bw.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-                        let _ = file.set_modified(UNIX_EPOCH + Duration::from_secs(f.mtime.max(0) as u64));
-                        drop(file);
-                        #[cfg(unix)]
+                KIND_SYMLINK => {
+                    #[cfg(unix)]
+                    {
+                        let target = f.link.as_deref().unwrap_or("");
+                        let depth = f.path.bytes().filter(|&b| b == b'/').count();
+                        let mut available = depth;
+                        if target.is_empty()
+                            || Path::new(target).components().any(|component| match component {
+                                Component::Normal(_) => {
+                                    available += 1;
+                                    false
+                                }
+                                Component::CurDir => false,
+                                Component::ParentDir if available > 0 => {
+                                    available -= 1;
+                                    false
+                                }
+                                _ => true,
+                            })
                         {
-                            use std::os::unix::fs::PermissionsExt;
-                            let _ = fs::set_permissions(&full, fs::Permissions::from_mode(f.mode & 0o7777));
+                            return Err(Error::Other("symlink target escapes the extraction root".into()));
                         }
-                        rep.files += 1;
-                        rep.bytes += f.size;
+                        dir.symlink_contents(target, name)?;
                     }
-                    Err(Error::BlockLost(_)) => {
-                        drop(bw);
-                        let _ = fs::remove_file(&full);
-                        rep.lost.push(f.path.clone());
-                    }
-                    Err(e) => return Err(e),
+                    #[cfg(not(unix))]
+                    return Err(Error::Unsupported("symlinks are not extracted on this platform".into()));
+                }
+                _ => {
+                    restore_file(a, f, &dir, name, &mut cache)?;
+                    rep.files += 1;
+                    rep.bytes += f.size;
                 }
             }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {}
+            Err(Error::BlockLost(_)) => rep.lost.push(f.path.clone()),
+            Err(e) => rep.skipped.push(format!("{} ({e})", f.path)),
         }
         done += f.size;
         progress.emit(Event::Progress { done, total });
     }
-    rep.healed_groups = a.healed_groups();
+    rep.healed_groups = a.healed_groups().saturating_sub(healed_before);
     Ok(rep)
 }
 
@@ -736,8 +1033,7 @@ pub fn import_zip(
     for i in 0..z.len() {
         let mut e = z.by_index(i).map_err(zerr)?;
         let Some(rel) = e.enclosed_name().and_then(|p| rel_name(&p)) else {
-            progress.emit(Event::Note(format!("skipped unsafe entry {}", e.name())));
-            continue;
+            return Err(Error::Other(format!("unsafe ZIP entry {}", e.name())));
         };
         let mtime = e
             .last_modified()
@@ -754,15 +1050,19 @@ pub fn import_zip(
             .unwrap_or(0);
         if e.is_dir() {
             w.add_dir(&rel, e.unix_mode().unwrap_or(0o755), mtime)?;
+        } else if e.is_symlink() {
+            let mut target = String::new();
+            (&mut e).take(1 << 16).read_to_string(&mut target)?;
+            if target.is_empty() || target.len() == 1 << 16 {
+                return Err(Error::Other(format!("invalid ZIP symlink target for {rel}")));
+            }
+            w.add_symlink(&rel, &target, e.unix_mode().unwrap_or(0o777), mtime)?;
         } else {
             let mode = e.unix_mode().unwrap_or(0o644);
             w.add_file(&rel, mode, mtime, &mut e)?;
         }
     }
-    let (summary, first) = w.finish(out)?;
-    if verify {
-        verify_written(&first, pw.as_deref(), progress)?;
-    }
+    let summary = w.finish(out, verify, pw.as_deref(), progress)?;
     Ok(PackResult { summary, verified: verify })
 }
 
@@ -787,8 +1087,7 @@ pub fn import_tar(
         let mut e = e?;
         let path = e.path()?.into_owned();
         let Some(rel) = rel_name(&path) else {
-            progress.emit(Event::Note(format!("skipped unsafe entry {}", path.display())));
-            continue;
+            return Err(Error::Other(format!("unsafe tar entry {}", path.display())));
         };
         let mode = e.header().mode().unwrap_or(0o644);
         let mtime = e.header().mtime().unwrap_or(0) as i64;
@@ -800,12 +1099,11 @@ pub fn import_tar(
             w.add_symlink(&rel, &target, mode, mtime)?;
         } else if t.is_file() {
             w.add_file(&rel, mode, mtime, &mut e)?;
+        } else {
+            return Err(Error::Unsupported(format!("cannot import tar entry {rel} of type {t:?}")));
         }
     }
-    let (summary, first) = w.finish(out)?;
-    if verify {
-        verify_written(&first, pw.as_deref(), progress)?;
-    }
+    let summary = w.finish(out, verify, pw.as_deref(), progress)?;
     Ok(PackResult { summary, verified: verify })
 }
 
@@ -813,9 +1111,10 @@ pub fn import_tar(
 
 /// Copy `src` to `dst` and corrupt `spans` random regions of `span_len` bytes (demos and tests).
 pub fn damage_copy(src: &Path, dst: &Path, spans: u32, span_len: usize, seed: u64) -> Result<Vec<(u64, usize)>> {
-    fs::copy(src, dst)?;
-    let len = fs::metadata(dst)?.len();
-    let mut f = OpenOptions::new().read(true).write(true).open(dst)?;
+    ensure_new(dst)?;
+    let mut stage = stage_file(dst, Some(src))?;
+    let f = stage.as_file_mut();
+    let len = f.metadata()?.len();
     let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
     let mut hits = Vec::new();
     let lo = 8192u64.min(len / 2);
@@ -835,7 +1134,7 @@ pub fn damage_copy(src: &Path, dst: &Path, spans: u32, span_len: usize, seed: u6
         f.write_all(&buf)?;
         hits.push((at, span));
     }
-    f.sync_all()?;
+    publish_file(stage, dst, false)?;
     Ok(hits)
 }
 

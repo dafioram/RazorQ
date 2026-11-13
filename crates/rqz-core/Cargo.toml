@@ -4,6 +4,7 @@ description = "razerq archive format: compression + RaptorQ erasure coding in on
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [features]
@@ -12,7 +13,7 @@ default = ["native"]
 native = ["parallel", "zstd-native", "fs"]
 parallel = ["dep:rayon"]
 zstd-native = ["dep:zstd"]
-fs = ["dep:walkdir", "dep:zip", "dep:tar", "dep:flate2"]
+fs = ["dep:walkdir", "dep:zip", "dep:tar", "dep:flate2", "dep:tempfile", "dep:cap-std", "dep:cap-fs-ext", "dep:rustix"]
 
 [dependencies]
 rqz-ecc = { path = "../rqz-ecc" }
@@ -33,6 +34,9 @@ walkdir = { version = "2", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 tar = { version = "0.4", optional = true }
 flate2 = { version = "1", optional = true }
+tempfile = { version = "3", optional = true }
+cap-std = { version = "4", optional = true }
+cap-fs-ext = { version = "4", optional = true }
 
 # Browser builds need getrandom's JS backend. Declared here so rqz-core builds for wasm32 on its own,
 # not only when pulled in through rqz-wasm.
@@ -41,3 +45,6 @@ getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1", features = ["fs"], optional = true }
